@@ -1,0 +1,23 @@
+# 密钥与本地配置（绝不提交）
+.env
+
+# Python 虚拟环境（本目录本身就是 venv）
+bin/
+include/
+lib/
+share/
+pyvenv.cfg
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# 向量库 / 缓存
+chroma/
+.agent_cache/
+.cache/
+
+# 日志
+*.log
