@@ -1,0 +1,21 @@
+# 代码助手安全沙箱镜像
+# 用途：run_shell / run_test / git 工具都在这个容器里执行
+# 构建：docker build -f Dockerfile.sandbox -t smart-coder-sandbox:latest .
+# 注：国内直连 Docker Hub 超时，FROM 走已验证可匿名拉取的镜像加速（等价于 library/python:3.11-slim）
+FROM docker.1ms.run/library/python:3.11-slim
+
+# 非 root 用户（禁止提权、禁止写系统目录）
+RUN useradd -m -u 1000 sandbox \
+    && mkdir -p /workspace \
+    && chown sandbox:sandbox /workspace
+
+# 常用工具 + 测试框架（按需最小集）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir pytest
+
+WORKDIR /workspace
+USER sandbox
+
+CMD ["/bin/bash"]
