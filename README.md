@@ -1018,8 +1018,6 @@ agent_env/                  ← 本身是 Python venv
 
 ---
 
-_本文档由真实开发过程整理，代码与结论均经过运行验证。如需完整代码，可以访问源码：[https://github.com/Maindarker/smart-coder]()，后续我将持续优化这个agent同步源代码并输出文档，欢迎感兴趣的朋友一起探索agent开发。_
-
 ## 后续展望
 
 - [ ] AST 感知的代码切分（按函数/类），提升检索精度
