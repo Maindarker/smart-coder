@@ -1,13 +1,22 @@
 """集中配置：从 .env 读取 DeepSeek API 配置与模型分工。"""
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from langchain_openai import ChatOpenAI
 
+from cost import tracker
+
 # 项目根目录 = 本文件所在目录
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
+
+# HuggingFace 模型权重缓存放到项目内（而非默认的 ~/.cache/huggingface），保持项目自包含。
+# 必须在导入 sentence_transformers / transformers 之前设置；rag.py 中这些是懒加载，故此处生效。
+os.environ.setdefault("HF_HOME", str(ROOT / ".cache" / "huggingface"))
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")  # 国内镜像加速，可被外部环境变量覆盖
+os.environ.setdefault("HF_HUB_OFFLINE", "1")  # 模型已本地缓存，离线加载：消除未认证警告、加载更快
 
 
 class Settings(BaseSettings):
@@ -43,4 +52,5 @@ def get_llm(model: str | None = None, temperature: float = 0.0, thinking: bool =
         openai_api_base=settings.deepseek_base_url,
         temperature=temperature,
         extra_body=extra,
+        callbacks=[tracker],
     )
