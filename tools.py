@@ -1,15 +1,15 @@
-"""安全的最小工具集：仅限工作区内读写，不执行任意命令。
+"""Agent 工具集：文件读写（本机受限）+ 命令执行/测试（Docker 沙箱）。
 
-命令执行（run_shell / run_test）留给你后续接 Docker 沙箱 —— 见文末 TODO。
+安全分层：
+- 文件读写：list_files / read_file 仅限工作区内，路径越界拒绝
+- 命令执行：run_shell / run_test 在非 root 的 Docker 沙箱内运行，默认断网、限时限内存
 """
 from pathlib import Path
 
 from langchain_core.tools import tool
 
 from config import settings
-
-# TODO: 命令执行 / 测试运行 / Git 操作，应在 Docker 沙箱容器内实现，
-#       这里刻意只保留「纯文件读写」这一最安全的最小集。
+from sandbox import CONTAINER_WORKDIR, run_command
 
 
 def _safe_path(p: str) -> Path:
@@ -19,6 +19,20 @@ def _safe_path(p: str) -> Path:
     if not path.is_relative_to(root):
         raise PermissionError(f"路径越界: {p}")
     return path
+
+
+def _fmt(r: dict) -> str:
+    """把沙箱执行结果格式化为给模型的文本。"""
+    parts = []
+    if r.get("stdout"):
+        parts.append(r["stdout"].rstrip())
+    if r.get("stderr"):
+        parts.append("[stderr]\n" + r["stderr"].rstrip())
+    tail = f"[exit_code={r.get('exit_code')}]"
+    if r.get("timed_out"):
+        tail += " [timed_out]"
+    parts.append(tail)
+    return "\n".join(parts)
 
 
 @tool
@@ -47,4 +61,24 @@ def read_file(path: str) -> str:
     return p.read_text(encoding="utf-8", errors="replace")
 
 
-TOOLS = [list_files, read_file]
+@tool
+def run_shell(command: str, allow_network: bool = False) -> str:
+    """在 Docker 沙箱内执行 shell 命令。默认断网、超时 60s、内存 512m。
+
+    适合：git status/diff/log、ls、grep、编译、运行脚本等。
+    需要网络的命令（git clone/push/pull、下载依赖）需 allow_network=True，
+    且这类危险操作应经过审批。
+    """
+    r = run_command(command, network=allow_network)
+    return _fmt(r)
+
+
+@tool
+def run_test(path: str = ".") -> str:
+    """在 Docker 沙箱内运行 pytest 测试。path 为工作区内相对路径（目录或文件）。"""
+    cwd = f"{CONTAINER_WORKDIR}/{path.strip('/')}"
+    r = run_command("python -m pytest -q", cwd=cwd, timeout=180)
+    return _fmt(r)
+
+
+TOOLS = [list_files, read_file, run_shell, run_test]
