@@ -123,9 +123,13 @@ LangGraph 把 Agent 建模成一张**有向状态图（StateGraph）**：节点�
 上面是"每个包为什么在"，下面是**从零开始的完整安装流程**，按顺序执行即可：
 
 ```bash
-# ① 创建并激活虚拟环境
-python3.11 -m venv agent_env
+# ① 创建并激活虚拟环境，打开终端（或命令提示符），进入你的项目目录，然后执行：
+python -m venv agent_env
+# macOS / Linux：
 source agent_env/bin/activate
+# Windows（命令提示符或 PowerShell）：
+agent_env\Scripts\activate
+# 激活成功后，终端提示符前会出现 (agent_env) 字样，表示当前处于虚拟环境中。
 
 # ② 升级 pip（旧版 resolver 解析新依赖容易失败）
 python -m pip install --upgrade pip
@@ -298,7 +302,7 @@ class Settings(BaseSettings):
 settings = Settings()
 ```
 
-对应的 `.env`：
+对应根目录下创建 `.env`：
 
 ```ini
 DEEPSEEK_API_KEY=sk-xxx
