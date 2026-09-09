@@ -6,13 +6,17 @@
   - 危险操作（rm -rf / git push / sudo / 联网命令等）触发 interrupt() 人工审批
 - reflect：Pro 模型结构化输出（thinking 关），判断是否完成
 - finish：Pro 模型总结汇报
-- 记忆：SqliteSaver checkpoint 持久化，按 thread_id 会话隔离
+- 记忆（两层）：
+  - 会话历史：State.messages（add_messages reducer）随 checkpoint 持久化，跨运行回放对话
+  - 长期偏好：remember_fact / recall_memory 工具落盘 .agent_cache/memory.md，跨会话可查
 """
 import re
 import sqlite3
+from typing import Annotated
 from typing_extensions import TypedDict
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
@@ -44,11 +48,26 @@ class AgentState(TypedDict):
     feedback: str
     done: bool
     iterations: int
+    messages: Annotated[list, add_messages]  # 会话历史，随 checkpoint 持久化、跨运行回放
 
 
 class Decision(BaseModel):
     done: bool = Field(description="任务是否已完成")
     feedback: str = Field(description="未完成时给出下一步具体反馈；完成时可留空")
+
+
+def _history_text(state: AgentState) -> str:
+    """把持久化的会话消息（用户/助手轮次）压缩成文本注入 prompt，实现跨会话记忆。"""
+    msgs = state.get("messages") or []
+    if not msgs:
+        return "（无历史）"
+    lines = []
+    for m in msgs:
+        role = "用户" if isinstance(m, HumanMessage) else "助手"
+        content = getattr(m, "content", "")
+        if isinstance(content, str) and content.strip():
+            lines.append(f"{role}：{content.strip()}")
+    return "\n".join(lines[-16:]) or "（无历史）"
 
 
 def _danger_check(tc: dict) -> str | None:
@@ -68,8 +87,10 @@ def _danger_check(tc: dict) -> str | None:
 def plan(state: AgentState) -> dict:
     llm = get_llm(settings.planner_model, thinking=True)
     msg = llm.invoke([
-        SystemMessage("你是资深代码助手。针对任务给出简洁、可执行的步骤计划，直接列步骤。"),
-        HumanMessage(f"任务：{state['task']}\n上一轮反馈：{state.get('feedback') or '无'}"),
+        SystemMessage("你是资深代码助手。针对任务给出简洁、可执行的步骤计划，直接列步骤。"
+                      "若任务涉及用户偏好或历史事实，先结合对话历史/记忆作答。"),
+        HumanMessage(f"任务：{state['task']}\n对话历史：\n{_history_text(state)}\n"
+                     f"上一轮反馈：{state.get('feedback') or '无'}"),
     ])
     return {"plan": msg.content, "iterations": state.get("iterations", 0) + 1}
 
@@ -91,10 +112,14 @@ def execute(state: AgentState) -> dict:
     llm = get_llm(settings.executor_model, thinking=False).bind_tools(TOOLS)
     ctx = state.get("context") or "（无相关代码上下文）"
     msgs = [
-        SystemMessage("你是执行器。用工具完成任务，最后用一句中文总结执行结果。可参考相关代码上下文。"),
+        SystemMessage(
+            "你是执行器。用工具完成任务，最后用一句中文总结执行结果。可参考相关代码上下文。"
+            "若任务涉及『记住/询问用户偏好或事实』：要记住时调用 remember_fact 写入长期记忆；"
+            "要查询时先调用 recall_memory 读取记忆再回答，不要凭空猜测。"
+        ),
         HumanMessage(
-            f"任务：{state['task']}\n计划：{state['plan']}\n反馈：{state.get('feedback') or '无'}\n"
-            f"相关代码上下文：\n{ctx}"
+            f"任务：{state['task']}\n计划：{state['plan']}\n对话历史：\n{_history_text(state)}\n"
+            f"反馈：{state.get('feedback') or '无'}\n相关代码上下文：\n{ctx}"
         ),
     ]
     result = ""
@@ -137,7 +162,8 @@ def reflect(state: AgentState) -> dict:
     d = decider.invoke([
         SystemMessage("评估执行结果是否已达成任务目标，未达成时给出针对性反馈。"),
         HumanMessage(
-            f"任务：{state['task']}\n计划：{state['plan']}\n执行结果：{state['result']}"
+            f"任务：{state['task']}\n计划：{state['plan']}\n对话历史：\n{_history_text(state)}\n"
+            f"执行结果：{state['result']}"
         ),
     ])
     return {"done": d.done, "feedback": d.feedback}
@@ -147,9 +173,10 @@ def finish(state: AgentState) -> dict:
     llm = get_llm(settings.planner_model, thinking=False)
     summary = llm.invoke([
         SystemMessage("用中文简洁汇报任务完成情况。"),
-        HumanMessage(f"任务：{state['task']}\n执行结果：{state['result']}"),
+        HumanMessage(f"任务：{state['task']}\n对话历史：\n{_history_text(state)}\n执行结果：{state['result']}"),
     ])
-    return {"result": summary.content}
+    # 把最终答复写回 messages，随 checkpoint 持久化，供下一轮对话回放
+    return {"result": summary.content, "messages": [AIMessage(content=summary.content)]}
 
 
 def route(state: AgentState) -> str:
@@ -171,7 +198,8 @@ graph.add_edge("execute", "reflect")
 graph.add_conditional_edges("reflect", route, {"execute": "execute", "finish": "finish"})
 graph.add_edge("finish", END)
 
-# 中长期记忆：checkpoint 持久化到项目内 sqlite，按 thread_id 做会话隔离（.agent_cache 已在 .gitignore）
+# 会话记忆：checkpoint 持久化到项目内 sqlite，按 thread_id 做会话隔离（.agent_cache 已在 .gitignore）
+# 长期偏好：由 remember_fact / recall_memory 工具落盘 .agent_cache/memory.md（见 tools.py）
 CHECKPOINT_DB = settings.workspace_root / ".agent_cache" / "checkpoints.sqlite"
 CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
 _conn = sqlite3.connect(str(CHECKPOINT_DB), check_same_thread=False)

@@ -1,15 +1,20 @@
-"""Agent 工具集：文件读写（本机受限）+ 命令执行/测试（Docker 沙箱）。
+"""Agent 工具集：文件读写（本机受限）+ 命令执行/测试（Docker 沙箱）+ 长期记忆。
 
 安全分层：
 - 文件读写：list_files / read_file 仅限工作区内，路径越界拒绝
 - 命令执行：run_shell / run_test 在非 root 的 Docker 沙箱内运行，默认断网、限时限内存
+- 长期记忆：remember_fact / recall_memory 落盘到 .agent_cache/memory.md，跨会话生效
 """
+import datetime
 from pathlib import Path
 
 from langchain_core.tools import tool
 
 from config import settings
 from sandbox import CONTAINER_WORKDIR, run_command
+
+# 长期记忆文件：与 checkpoint sqlite 同目录，均已在 .gitignore 中
+MEMORY_FILE = settings.workspace_root / ".agent_cache" / "memory.md"
 
 
 def _safe_path(p: str) -> Path:
@@ -81,4 +86,30 @@ def run_test(path: str = ".") -> str:
     return _fmt(r)
 
 
-TOOLS = [list_files, read_file, run_shell, run_test]
+@tool
+def remember_fact(fact: str) -> str:
+    """把一条需要长期记住的事实/偏好写入记忆库（例如用户偏好、项目约定、决定）。
+
+    之后无论哪个会话，都可用 recall_memory 查回这条事实。
+    """
+    p = MEMORY_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"- [{ts}] {fact.strip()}"
+    with p.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    return f"已记住：{fact.strip()}"
+
+
+@tool
+def recall_memory(query: str = "") -> str:
+    """读取长期记忆库中的事实/偏好。query 为关键词（留空返回全部）。"""
+    if not MEMORY_FILE.exists():
+        return "（记忆库为空）"
+    lines = MEMORY_FILE.read_text(encoding="utf-8").strip().splitlines()
+    if query:
+        lines = [l for l in lines if query.lower() in l.lower()]
+    return "\n".join(lines) if lines else "（没有匹配的记忆）"
+
+
+TOOLS = [list_files, read_file, run_shell, run_test, remember_fact, recall_memory]

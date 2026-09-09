@@ -59,7 +59,7 @@ LangGraph 把 Agent 建模成一张**有向状态图（StateGraph）**：节点�
 | **Agent Loop** | LangGraph StateGraph                 | `plan → retrieve → execute → reflect → finish`        |
 | **工具集**     | LangChain `@tool`                    | 文件读写（本机受限）+ 命令/测试（Docker 沙箱）        |
 | **RAG**        | ChromaDB + rank-bm25 + cross-encoder | 代码库索引、混合检索、重排                            |
-| **记忆**       | SqliteSaver + `thread_id`            | 任务状态落盘、会话隔离                                |
+| **记忆**       | SqliteSaver + 偏好文件                | 会话历史回放 + 长期偏好记忆（跨会话）                |
 | **安全层**     | Docker（非 root 容器）               | 命令隔离 + 危险操作 `interrupt()` 审批                |
 
 ### 2.3 Agent Loop 设计
@@ -586,7 +586,7 @@ print(sandbox.run_command('echo hello && whoami && python --version'))
 def index_codebase(root=None):
     """扫描代码 → 行级切分（40 行/chunk，重叠 10 行）→ embedding → 写 Chroma + 建 BM25"""
     corpus, meta, ids = [], [], []
-    for path in _iter_code_files(root):        # 只扫 *.py（前端适配见 12 章）
+    for path in _iter_code_files(root):        # 只扫 *.py
         ...
     embeddings = embedder.encode(corpus, normalize_embeddings=True).tolist()
     collection.add(ids=ids, embeddings=embeddings, documents=corpus, metadatas=meta)
@@ -688,6 +688,26 @@ app.invoke(state, config={"configurable": {"thread_id": "会话B"}})   # 隔离
 ```
 
 > `.agent_cache/`、`chroma/` 都是运行时产物，记得进 `.gitignore`。
+
+### 8.4 长期记忆：会话历史 + 偏好文件
+
+checkpoint 只负责"落盘状态"，本身并不会"记住用户说过的话"。本项目在它之上又加了两层，让 agent 能跨会话回忆起用户的偏好：
+
+| 层       | 载体                              | 机制                                             | 作用                   |
+| -------- | --------------------------------- | ------------------------------------------------ | ---------------------- |
+| 会话历史 | `State.messages`（`add_messages`） | 随 checkpoint 持久化，每轮追加用户话 / 助手答    | 同线程内回放上下文     |
+| 长期偏好 | `.agent_cache/memory.md`          | `remember_fact` 写入、`recall_memory` 查询       | 跨线程可召回事实/偏好  |
+
+- 每次运行 `main.py` 只把新提问以 `HumanMessage` 追加进 `messages`，最终答复以 `AIMessage` 写回，不会覆盖历史。
+- "记住 xx / 我偏好 xx"这类任务，`execute` 节点会调 `remember_fact` 落盘；询问时先 `recall_memory` 再作答，不靠猜。
+- `memory.md` 是全局的，所以**不必带 `--thread`** 也能查回偏好；`--thread` 只用于开多个互相隔离的会话。
+
+示例：
+
+```bash
+python main.py "记住：我偏好用 pytest 而不是 unittest"
+python main.py "我现在偏好什么测试框架？"   # → 你偏好使用 pytest
+```
 
 ---
 
