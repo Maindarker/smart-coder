@@ -88,13 +88,50 @@ LangGraph 把 Agent 建模成一张**有向状态图（StateGraph）**：节点�
 
 ## 三、环境准备与依赖选型
 
-### 3.1 运行环境
+### 3.1 运行环境：两套方案，先选一套
 
-| 项     | 值                                     |
-| ------ | -------------------------------------- |
-| 系统   | macOS（Apple Silicon）                 |
-| Python | 3.11.2（项目本身就是一个 venv 根目录） |
-| Docker | Docker Desktop 29.7.2                  |
+代码把「**命令在哪执行**」和「**代码怎么被检索**」拆成了两个**互相独立**的开关
+（`config.py` 的 `exec_mode` / `rag_enabled`，在 `.env` 里配），所以运行环境有两套推荐搭配：
+
+|                        | 方案 A · 轻量模式（**推荐默认**）                  | 方案 B · 完整模式                              |
+| ---------------------- | ------------------------------------------------- | ---------------------------------------------- |
+| `.env` 两个开关        | `EXEC_MODE=host` + `RAG_ENABLED=false`            | `EXEC_MODE=docker` + `RAG_ENABLED=true`        |
+| 依赖文件               | `requirements.txt`                                | `requirements-full.txt`                        |
+| 额外前置               | **无**，Python 3.11 就够                          | Docker Desktop（沙箱镜像首用自动构建）         |
+| 命令在哪跑             | 你的本机 shell（继承当前环境，项目自带 venv 优先；只有超时兜底，无 CPU/内存限制）| 非 root 容器：默认断网、1 CPU、512MB、60s 超时 |
+| 安全靠什么兜底         | **每条 `run_shell`/`run_test` 都弹人工审批** + 危险命令拦截 | 容器隔离 + 危险命令拦截（普通命令不逐条审批） |
+| 能跑什么项目           | **任意语言**（node / go / rust / java …）         | 目前只有 **Python**（镜像只带 Python 运行时）  |
+| 代码怎么定位           | agent 用 `describe_project`/`list_files`/`search_code`/`read_file` 自己找 | 先 RAG：向量 + BM25 混合检索 → 重排 → 相关代码块注入上下文 |
+| 体积（macOS 实测）     | 约几百 MB（无 torch / chroma）                    | site-packages 1.4GB，另需首次下载约 239MB 模型权重 |
+
+> 两套方案的共同点：系统 macOS / Linux / Windows 都行（Docker 能跑就支持方案 B），
+> Python 3.11，密钥只填 `.env` 里的 `DEEPSEEK_API_KEY`。
+> 方案 A 就是仓库里 `.env.example` 的那套配置：拷一份、填上 key 即可。
+>
+> ⚠️ 注意 `RAG_ENABLED` 要**显式写 false**：`config.py` 里这个字段的默认值是 `true`
+> （`EXEC_MODE` 的默认值已经是 `host`，两者不对称），不写就会去连向量库、而轻量模式没装
+> `chromadb`，每个任务都会往上下文里塞一句"检索失败"。
+
+**为什么把轻量模式当默认**：这个 agent 面向"任意语言、任意项目"，
+而沙箱镜像（`Dockerfile.sandbox`）只带 Python 运行时 —— 拿 docker 当默认，
+同事第一次帮一个前端项目跑 `npm test` 就会撞墙。轻量模式把隔离手段从"容器兜底"
+换成"**逐条人工审批**兜底"：`agent.py` 里 host 模式下任何 `run_shell` / `run_test`
+都会先 `interrupt` 问一句（拒绝普通命令不终止任务、agent 会换个方式重试；
+拒绝危险命令则终止任务，见第九节）。安全语义没丢，只是从"机器拦"变成"人看一眼"。
+RAG 同理：开它要装 torch/chroma 并首次下载模型，而关掉后 agent 靠
+`search_code` 等工具自己找代码，对多数任务已经够用。
+
+**两个开关其实互相独立，4 种组合都合法**，上表只是两套推荐搭配：
+
+- `host` + `RAG_ENABLED=true`：想在本机跑、但想要向量检索 → 装 `requirements-full.txt` 即可；
+- `docker` + `RAG_ENABLED=false`：只想要强隔离、不想下模型（要求项目是 Python）；
+- 混装时**不需要**改代码：`rag.py` 与 `sandbox.py` 里的重依赖都是**函数内懒加载**的
+  （`chromadb` / `sentence_transformers` / `rank_bm25` 在 `rag.py` 函数里，
+  `docker` 在 `sandbox.py` 的 `try/except ImportError` 里）。
+
+**回退与排错**：请求了 docker 却没装 docker Python 库 → 启动时打印一次提示并
+**自动回退 host**（`sandbox.effective_mode()`）；装了库但 Docker Desktop 没启动 →
+命令会报错，用 `GET /api/health` 的 `exec_mode` 字段（Web 页面顶部也会显示）看**实际生效**的模式。
 
 ### 3.2 依赖包清单与用途
 
@@ -120,52 +157,101 @@ LangGraph 把 Agent 建模成一张**有向状态图（StateGraph）**：节点�
 
 > 💡 经验：`langgraph 1.x` 已经把 checkpoint 后端拆成独立包（`langgraph-checkpoint-sqlite` / `-postgres`），`SqliteSaver` 不在核心包里，很多人会在这里踩"ModuleNotFoundError"。
 
+> 📌 **上表是"每个包为什么在"，但并不是全都要装**：真正钉死版本的清单是
+> `requirements.txt`（方案 A）和 `requirements-full.txt`（方案 B = A + 重依赖），
+> 两者不一致时以这两个文件为准。
+> **只有方案 B 才需要的包**：`chromadb`、`sentence-transformers`、`torch`/`transformers`、
+> `rank-bm25`、`langchain-chroma`、`docker` —— 它们在代码里全是**懒加载**：
+> 关掉 RAG、用 host 模式时根本不会被 import，所以不装也能跑。
+> 反过来，`uvicorn`（起 Web 服务）、`langgraph-checkpoint-sqlite`（记忆落盘）、
+> `pytest` 两个方案都要，别漏。
+> （`tiktoken` 是早期版本的遗留项，现在的 `cost.py` 直接用模型回报的 usage，已不再需要。）
+
 ### 3.3 安装命令（可直接复制）
 
-上面是"每个包为什么在"，下面是**从零开始的完整安装流程**，按顺序执行即可：
+两条路都是「**先建 venv → 再装对应那份 requirements**」，区别只在装哪个文件、`.env` 里两个开关怎么配。
+两份 requirements 都把版本钉死了，所以**不要**再手抄包名（手抄容易漏、也容易装错 docker SDK 版本）。
+
+**① 公共步骤（两套方案都要）**
 
 ```bash
-# ① 创建并激活虚拟环境，打开终端（或命令提示符），进入你的项目目录，然后执行：
-python -m venv agent_env
-# macOS / Linux：
-source agent_env/bin/activate
-# Windows（命令提示符或 PowerShell）：
-agent_env\Scripts\activate
-# 激活成功后，终端提示符前会出现 (agent_env) 字样，表示当前处于虚拟环境中。
+# 创建并激活虚拟环境（目录名随便取，这里用 agent_env）
+python3.11 -m venv agent_env
+source agent_env/bin/activate        # macOS / Linux
+agent_env\Scripts\activate           # Windows（cmd / PowerShell）
+# 激活成功后提示符前会出现 (agent_env) 字样
 
-# ② 升级 pip（旧版 resolver 解析新依赖容易失败）
+# 升级 pip（旧版 resolver 解析新依赖容易失败）
 python -m pip install --upgrade pip
-
-# ③ 一次装齐全部核心依赖
-#    - Agent 框架：langgraph / langchain / langchain-openai
-#    - 记忆后端：langgraph-checkpoint + langgraph-checkpoint-sqlite
-#    - RAG 基础设施：chromadb / sentence-transformers / rank-bm25 / langchain-chroma
-#    - 配置与工具：pydantic-settings / python-dotenv / tiktoken / pytest / docker
-pip install langgraph langchain langchain-openai \
-    langgraph-checkpoint langgraph-checkpoint-sqlite \
-    chromadb sentence-transformers rank-bm25 langchain-chroma \
-    pydantic-settings python-dotenv tiktoken pytest docker
-
-# ④ ⚠️ Docker SDK 版本核对：某些环境默认装到 2016 年的 docker-py 1.10.6，
-#    必须升到 7.x（原因与报错见 6.5 节坑 5）
-pip show docker | grep -i version    # 若显示 1.x.x，执行下面两步
-pip uninstall -y docker docker-py docker-pycreds
-pip install docker                   # → 应为 7.2.0
 ```
+
+**② 方案 A · 轻量模式（默认，约几百 MB，无需 Docker）**
+
+```bash
+pip install -r requirements.txt
+```
+
+`.env` 最少填 key，两个开关建议**显式写上**（`RAG_ENABLED` 的代码默认值是 `true`，见 3.1 节末尾的提醒）：
+
+```ini
+DEEPSEEK_API_KEY=sk-你的key
+EXEC_MODE=host          # 命令在本机跑，逐条人工审批
+RAG_ENABLED=false       # 不做向量检索，agent 用工具自己找代码
+```
+
+到这里就能用了，**不需要** Docker、**不需要**下载任何模型：
+
+```bash
+python main.py "这个项目的测试怎么跑？跑一下" --project=/绝对路径/你的项目   # CLI
+bash run-web.sh                                                          # 或浏览器版
+```
+
+**③ 方案 B · 完整模式（Docker 沙箱 + 本地 RAG）**
+
+```bash
+pip install -r requirements-full.txt   # = requirements.txt + chromadb/sentence-transformers/torch/docker…
+docker info >/dev/null && echo "Docker 就绪"   # 需要 Docker Desktop 已经在跑
+```
+
+`.env` 换一套开关：
+
+```ini
+DEEPSEEK_API_KEY=sk-你的key
+EXEC_MODE=docker        # 命令在非 root 容器内跑：默认断网、1 CPU、512MB、60s 超时
+RAG_ENABLED=true        # 向量 + BM25 混合检索后重排，相关代码块注入上下文
+```
+
+> 沙箱镜像**不用手动 build**：docker 模式下第一次执行命令时会用 `Dockerfile.sandbox`
+> 自动构建（首次约 1~3 分钟），见 6.2 / 6.6 节。
 
 几点说明：
 
-- `sentence-transformers` 会自动带上 `torch` / `transformers`（体积大，属正常现象）
-- embedding 与 cross-encoder 的**模型权重不是 pip 包**：首次调用时才从 Hugging Face 下载（国内网络建议配镜像，见 7.3 节）
-- 别忘了在项目根目录建 `.env`（内容见 5.1 节），并把 `.env` 加进 `.gitignore`
+- **体积**：`sentence-transformers` 会自动带上 `torch` / `transformers`，属正常现象。
+  本机（macOS Apple Silicon）实测 site-packages 共 **1.4GB**，其中重的那几块是
+  torch 587MB + transformers 112MB + scipy 99MB + sklearn 48MB + numpy 36MB + chromadb 6.5MB
+  ≈ **890MB**，方案 A 就是把这 890MB 省掉；Linux 上 torch 还会带 CUDA 轮子，3~5GB 很常见。
+- **模型权重不是 pip 包**：开 RAG 后首次调用 embedding / cross-encoder 时才从 Hugging Face
+  下载（两者合计约 **239MB**，落在项目内 `.cache/huggingface`）。`config.py` 已经默认走
+  `hf-mirror.com` 镜像并设好 `HF_HOME`，国内网络不用额外配置，细节见 7.3 节。
+- **两套方案随时互切**：改 `.env` 两个开关即可，代码不用动；依赖是"装多了不影响"——
+  方案 B 装了重依赖后也能跑 `EXEC_MODE=host`。想让环境也瘦回去：
+  `pip uninstall -y torch transformers sentence-transformers chromadb langchain-chroma rank-bm25 docker`。
+- **手工装（不用 requirements 文件）时的坑**：某些环境会把 `docker` 装成 2016 年的
+  `docker-py 1.10.6`，必须升到 7.x（原因与报错见 6.5 节坑 5）；
+  `requirements-full.txt` 里已经钉了 `docker==7.2.0`，所以走文件安装不用管。
+- **Windows / Linux 装不上 torch 时**：按 `requirements-full.txt` 里的注释去掉版本号，让 pip 按平台挑。
+- 别忘了在项目根目录建 `.env`（完整字段见 5.1 节），并把 `.env` 加进 `.gitignore`。
 
 ### 3.4 环境自检
 
 装完先做三件事确认"地基"是稳的：
 
 ```python
-# 1) 关键模块能否导入
-import langgraph, langchain_openai, chromadb, sentence_transformers
+# 1) 关键模块能否导入（两套方案都要）
+import langgraph, langchain_openai, fastapi
+
+# 方案 B（完整模式）再多验这几个；方案 A 没装它们，这里报 ModuleNotFoundError 是正常的
+import chromadb, sentence_transformers, docker
 
 # 2) LangGraph 的最小图能否编译 + 运行
 from typing_extensions import TypedDict
@@ -183,9 +269,16 @@ g.add_edge(START, "add")
 g.add_edge("add", END)
 app = g.compile()
 assert app.invoke({"x": 0})["x"] == 1
+
+# 3) 确认实际生效的执行模式与 RAG 开关
+import sandbox
+from config import settings
+print(sandbox.effective_mode(), settings.rag_enabled)
+# 期望：方案 A → host False；方案 B → docker True
+# （请求了 docker 但没装 docker 库时会自动回退成 host，见 3.1 节）
 ```
 
-如果这两步都过，说明 LangGraph 主链路是好的，后面所有问题都集中在**接入层**（API 兼容、网络、容器）。
+如果这几步都过，说明 LangGraph 主链路是好的，后面所有问题都集中在**接入层**（API 兼容、网络、容器）。
 
 ---
 
@@ -402,7 +495,11 @@ python main.py "列出项目根目录的文件，说明项目是做什么的"
 
 ### 6.1 设计思路
 
-让 Agent 在宿主机上直接 `subprocess` 跑命令等于裸奔。安全设计分层：
+> 📌 **本章讲的是方案 B（`EXEC_MODE=docker`）**。默认的轻量模式（方案 A）没有容器隔离：
+> 命令在本机直跑，安全靠"每条 `run_shell`/`run_test` 人工审批 + 危险模式拦截"兜底
+> （两套方案的取舍见 3.1 节）。只想用方案 A 的话，本章可以跳过。
+
+让 Agent 在宿主机上直接 `subprocess` 跑命令、又**不设人工审批**，等于裸奔。所以安全设计是分层的：
 
 1. **命令执行进容器**：用非 root 用户 `sandbox` 跑
 2. **资源受限**：内存 512M、CPU 1 核、默认断网、超时强制 kill
@@ -571,6 +668,10 @@ print(sandbox.run_command('echo hello && whoami && python --version'))
 ---
 
 ## 七、RAG 代码检索引擎
+
+> 📌 **本章讲的是方案 B（`RAG_ENABLED=true`）**。默认的轻量模式不开 RAG，跳过本章不影响主流程：
+> `RAG_ENABLED=false` 时 `retrieve_node` 直接返回空上下文，改由执行器用
+> `describe_project` / `list_files` / `search_code` / `read_file` 自己定位代码（见 3.1 节）。
 
 > 代码仓库动辄几万行，全塞进 LLM 上下文既不现实也烧钱。RAG 的目标：**给定任务，从代码库里捞出最相关的几个片段**喂给执行器。本项目实现的是"向量 + BM25 混合 + 重排"三段式。
 
