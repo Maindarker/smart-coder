@@ -1,0 +1,25 @@
+# smart-coder 依赖 —— 完整模式（开发者 / 能接受大依赖的同事）
+# 用法：pip install -r requirements-full.txt
+# 完整模式（.env 里 RAG_ENABLED=true + EXEC_MODE=docker）：
+#   - RAG：本地 embedding(chromadb + sentence-transformers) + BM25 + 重排
+#   - Docker 沙箱：命令在非 root / 断网 / 限资源容器内执行
+# 轻量模式只装 requirements.txt 即可，本文件 = 轻量 + 重依赖。
+# 注意：torch/transformers 版本为本机(macOS)实测；Linux/Windows 装不上时去掉版本号让 pip 按平台选择。
+langgraph==1.2.11
+langgraph-checkpoint-sqlite==3.1.1
+langchain-core==1.6.2
+langchain-openai==1.6.0
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+fastapi==0.141.1
+uvicorn==0.52.4
+pytest==9.1.1
+
+# ---- 以下为完整模式额外依赖 ----
+chromadb==1.5.9
+langchain-chroma==1.1.0
+rank-bm25==0.2.2
+sentence-transformers==6.0.1
+torch==2.14.0
+transformers==5.16.1
+docker==7.2.0

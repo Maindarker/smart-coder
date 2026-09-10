@@ -1,0 +1,17 @@
+# smart-coder 依赖 —— 轻量模式（同事默认，约几百 MB）
+# 用法：python3.11 -m venv .venv && source .venv/bin/activate
+#       pip install -r requirements.txt
+#
+# 轻量模式（.env 里 RAG_ENABLED=false + EXEC_MODE=host）：
+#   - 无 torch / chromadb / 本地 embedding 模型（省 3~5GB）
+#   - 无 Docker 沙箱，命令在本机直接执行、逐条人工审批
+#   - agent 用 list_files / search_code / read_file 工具自行定位代码
+langgraph==1.2.11
+langgraph-checkpoint-sqlite==3.1.1
+langchain-core==1.6.2
+langchain-openai==1.6.0
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+fastapi==0.141.1
+uvicorn==0.52.4
+pytest==9.1.1

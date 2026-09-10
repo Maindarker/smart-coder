@@ -66,6 +66,56 @@ def read_file(path: str) -> str:
     return p.read_text(encoding="utf-8", errors="replace")
 
 
+# 代码搜索要跳过的目录（venv/缓存/依赖树等大而无用的内容）
+_SKIP_DIRS = {".git", "__pycache__", ".venv", "chroma", "node_modules", "site-packages",
+              "bin", "lib", "include", "share", ".cache", "dist", "build"}
+
+
+@tool
+def search_code(query: str, path: str = ".") -> str:
+    """在工作区内按关键词搜索代码（纯文本匹配、大小写不敏感、无需本地模型）。
+
+    轻量模式关闭 RAG 后，这是 agent 定位代码的主要手段；返回 路径:行号: 内容。
+    path 可为目录或单个文件。
+    """
+    root = settings.workspace_root.resolve()
+    base = _safe_path(path)
+    if base.is_file():
+        files = [base]
+    elif base.is_dir():
+        files = [p for p in sorted(base.rglob("*")) if p.is_file()]
+    else:
+        return f"路径不存在: {path}"
+    needle = query.lower()
+    out: list[str] = []
+    hits_total = 0
+    for p in files:
+        if any(part in _SKIP_DIRS for part in p.relative_to(root).parts):
+            continue
+        if p.stat().st_size > 200_000:
+            continue
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw[:8192]:  # 疑似二进制，跳过
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        for i, line in enumerate(text.splitlines(), 1):
+            if needle in line.lower():
+                shown = line.strip()
+                if len(shown) > 300:
+                    shown = shown[:300] + "…"
+                out.append(f"{p.relative_to(root)}:{i}: {shown}")
+                hits_total += 1
+                if hits_total >= 200:
+                    out.append("…（结果过多已截断，请缩小关键词范围）")
+                    return "\n".join(out)
+        if hits_total >= 200:
+            break
+    return "\n".join(out) if out else "（没有匹配的代码）"
+
+
 @tool
 def run_shell(command: str, allow_network: bool = False) -> str:
     """在 Docker 沙箱内执行 shell 命令。默认断网、超时 60s、内存 512m。
@@ -112,4 +162,4 @@ def recall_memory(query: str = "") -> str:
     return "\n".join(lines) if lines else "（没有匹配的记忆）"
 
 
-TOOLS = [list_files, read_file, run_shell, run_test, remember_fact, recall_memory]
+TOOLS = [list_files, read_file, search_code, run_shell, run_test, remember_fact, recall_memory]

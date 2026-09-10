@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smart-coder · 代码助手</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 860px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; }
+  #workspace { color: #888; font-size: 12px; word-break: break-all; }
+  #task { width: 100%; box-sizing: border-box; height: 64px;
+          border: 1px solid #999; border-radius: 8px; padding: 8px; font: inherit; }
+  button { font: inherit; cursor: pointer; }
+  #run { margin-top: 8px; padding: 6px 18px; border-radius: 8px; border: 0;
+         background: #2f6fed; color: #fff; }
+  #run:disabled { opacity: .5; cursor: wait; }
+  #log { background: #0000000d; border-radius: 8px; padding: 12px; margin-top: 12px;
+         white-space: pre-wrap; word-break: break-word; min-height: 120px; font-size: 14px; }
+  #dialog { position: fixed; inset: 0; background: #0008; display: none;
+            align-items: center; justify-content: center; }
+  #dialog.open { display: flex; }
+  .card { background: #fff; color: #111; max-width: 560px; border-radius: 12px;
+          padding: 20px; box-shadow: 0 8px 30px #0006; }
+  .card pre { background: #f4f4f4; padding: 8px; border-radius: 8px;
+              white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow: auto; }
+  .card button { margin-right: 8px; margin-top: 12px; padding: 8px 20px; border-radius: 8px;
+                 border: 0; color: #fff; }
+  #allow { background: #d33; }      /* 危险操作，允许按钮用警示色 */
+  #deny  { background: #666; }
+</style>
+</head>
+<body>
+<h1>🤖 smart-coder</h1>
+<div id="workspace">工作区加载中…</div>
+
+<textarea id="task" placeholder="例如：帮我看看 src/utils 里的日期格式化函数有什么 bug"></textarea>
+<div><button id="run">运行任务</button></div>
+<div id="log">（运行结果会显示在这里）</div>
+
+<div id="dialog">
+  <div class="card">
+    <h3>⚠️ 危险操作需要审批</h3>
+    <div id="q"></div>
+    <button id="allow">允许执行</button>
+    <button id="deny">拒绝</button>
+  </div>
+</div>
+
+<script>
+let busy = false, es = null, taskId = null, approvalId = null;
+const $ = id => document.getElementById(id);
+
+async function loadWorkspace() {
+  try {
+    const j = await (await fetch('/api/workspace')).json();
+    $('workspace').textContent = '当前工作区：' + j.workspace_root
+      + (j.exists ? '' : '（目录不存在，请检查 WORKSPACE_ROOT）')
+      + '　·　换项目：改 .env 的 WORKSPACE_ROOT 后重启服务';
+  } catch (e) {
+    $('workspace').textContent = '无法获取工作区信息';
+  }
+}
+
+async function submit() {
+  if (busy) return;
+  const task = $('task').value.trim();
+  if (!task) { $('log').textContent = '请先输入任务描述。'; return; }
+
+  busy = true; $('run').disabled = true;
+  $('log').textContent = '任务已提交，等待执行…\n';
+
+  try {
+    const r = await fetch('/api/tasks', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task }) });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      $('log').textContent = '❌ 提交失败：' + (err.detail || r.statusText);
+      finish(); return;
+    }
+    taskId = (await r.json()).task_id;
+  } catch (e) {
+    $('log').textContent = '❌ 无法连接服务：' + e;
+    finish(); return;
+  }
+
+  es = new EventSource(`/api/tasks/${taskId}/events`);
+  es.onmessage = (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.type === 'approval') {
+      approvalId = ev.approval_id;
+      $('q').innerHTML = '<p>' + escapeHtml(ev.question) + '</p>'
+        + '<p>工具：<code>' + escapeHtml(ev.tool || '-') + '</code></p>'
+        + '<pre>' + escapeHtml(JSON.stringify(ev.args, null, 2)) + '</pre>';
+      $('dialog').classList.add('open');
+    } else if (ev.type === 'done') {
+      append('\n━━━ 完成 ━━━\n' + ev.result + '\n' + ev.cost);
+      es.close(); finish();
+    } else if (ev.type === 'error') {
+      append('\n❌ ' + ev.message + (ev.hint ? '\n💡 ' + ev.hint : ''));
+      es.close(); finish();
+    } else if (ev.type === 'log') {
+      append('\n' + ev.message);
+    }
+  };
+  // SSE 断开说明任务结束或连接中断；EventSource 会自动重连，出错时兜底收尾
+  es.onerror = () => { if (es && es.readyState === EventSource.CLOSED) finish(); };
+}
+
+async function decide(approved) {
+  $('dialog').classList.remove('open');
+  if (!approvalId) return;
+  const id = approvalId; approvalId = null;
+  append(approved ? '\n→ 已批准该操作' : '\n→ 已拒绝该操作');
+  try {
+    await fetch(`/api/tasks/${taskId}/approve`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ approval_id: id, approved }) });
+  } catch (e) { /* 若连接已断，引擎侧超时会按拒绝处理 */ }
+}
+
+function append(text) {
+  const log = $('log');
+  log.textContent += text;
+  log.scrollTop = log.scrollHeight;
+}
+function finish() { busy = false; $('run').disabled = false; }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+$('run').onclick = submit;
+$('allow').onclick = () => decide(true);
+$('deny').onclick = () => decide(false);
+loadWorkspace();
+</script>
+</body>
+</html>

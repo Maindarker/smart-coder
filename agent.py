@@ -97,6 +97,9 @@ def plan(state: AgentState) -> dict:
 
 def retrieve_node(state: AgentState) -> dict:
     """RAG 检索：根据任务+计划检索相关代码片段，注入上下文。检索失败不阻断主流程。"""
+    if not settings.rag_enabled:
+        # 轻量模式：不做 RAG（无需本地向量/重排模型），让执行器用工具自行定位代码
+        return {"context": ""}
     query = f"{state['task']} {state['plan']}"
     try:
         hits = retrieve(query, k=RETRIEVE_K)
@@ -110,7 +113,9 @@ def retrieve_node(state: AgentState) -> dict:
 
 def execute(state: AgentState) -> dict:
     llm = get_llm(settings.executor_model, thinking=False).bind_tools(TOOLS)
-    ctx = state.get("context") or "（无相关代码上下文）"
+    hint = ("（未启用 RAG。定位代码请先用 list_files / search_code / read_file 工具，"
+            "不要凭空猜路径。）" if not settings.rag_enabled else "（无相关代码上下文）")
+    ctx = state.get("context") or hint
     msgs = [
         SystemMessage(
             "你是执行器。用工具完成任务，最后用一句中文总结执行结果。可参考相关代码上下文。"
@@ -134,17 +139,30 @@ def execute(state: AgentState) -> dict:
             if fn is None:
                 obs = f"未知工具: {tc['name']}"
             else:
-                # 危险操作人工审批
-                danger = _danger_check(tc)
-                if danger:
+                # 人工审批：
+                #   - 危险操作（rm -rf / git push / sudo …）一律审批；
+                #   - host 模式（无 Docker 沙箱）下，任何 run_shell / run_test 命令都逐条审批。
+                reason = _danger_check(tc)
+                if reason is None and tc["name"] in ("run_shell", "run_test") \
+                        and settings.exec_mode == "host":
+                    reason = "轻量模式（无 Docker 沙箱）：命令在本机直接执行"
+                if reason:
                     decision = interrupt({
-                        "question": f"是否允许执行以下危险操作？\n工具：{tc['name']}\n参数：{tc['args']}\n风险：{danger}",
+                        "question": f"是否允许执行以下操作？\n工具：{tc['name']}\n参数：{tc['args']}\n原因：{reason}",
                         "tool": tc["name"],
                         "args": tc["args"],
-                        "reason": danger,
+                        "reason": reason,
                     })
                     if not (decision or {}).get("approved"):
-                        return {"result": f"用户已拒绝执行该危险操作（{danger}），任务已终止。"}
+                        if _danger_check(tc):
+                            # 危险操作被拒 → 终止任务（保持原有安全语义）
+                            return {"result": f"用户已拒绝执行该危险操作（{reason}），任务已终止。"}
+                        # host 模式普通命令被拒 → 不终止任务：把反馈喂回模型，让它换一种方式
+                        msgs.append(ToolMessage(
+                            content=f"用户拒绝了这条命令（{reason}）。"
+                                    f"请改用不执行该命令的方式完成任务，或先向用户说明必要性。",
+                            tool_call_id=tc["id"]))
+                        continue
                 try:
                     obs = fn.invoke(tc["args"])
                 except Exception as e:  # noqa: BLE001 —— 工具异常回传给模型重试

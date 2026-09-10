@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from langchain_openai import ChatOpenAI
 
@@ -14,9 +15,13 @@ load_dotenv(ROOT / ".env")
 
 # HuggingFace 模型权重缓存放到项目内（而非默认的 ~/.cache/huggingface），保持项目自包含。
 # 必须在导入 sentence_transformers / transformers 之前设置；rag.py 中这些是懒加载，故此处生效。
-os.environ.setdefault("HF_HOME", str(ROOT / ".cache" / "huggingface"))
+HF_CACHE = ROOT / ".cache" / "huggingface"
+os.environ.setdefault("HF_HOME", str(HF_CACHE))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")  # 国内镜像加速，可被外部环境变量覆盖
-os.environ.setdefault("HF_HUB_OFFLINE", "1")  # 模型已本地缓存，离线加载：消除未认证警告、加载更快
+# 模型已缓存 → 离线加载（更快、消除未认证警告）；
+# 全新机器没缓存 → 不设 OFFLINE，首次使用 embedding/重排时自动联网下载（约 200MB）。
+if (HF_CACHE / "hub").exists():
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 
 class Settings(BaseSettings):
@@ -29,8 +34,21 @@ class Settings(BaseSettings):
     planner_model: str = "deepseek-v4-pro"    # 规划 / 反思用强推理模型
     executor_model: str = "deepseek-v4-flash"  # 执行 / 工具调用用快模型
 
-    # 安全：agent 只允许在这个目录内读写文件
-    workspace_root: Path = ROOT
+    # 安全：agent 只允许在这个目录内读写文件。
+    # 默认 = agent 自身目录；设置 WORKSPACE_ROOT 环境变量后，可指向任意用户代码库
+    # （本机 Web 形态的关键开关：每个使用者把 WORKSPACE_ROOT 填成自己的项目路径）。
+    workspace_root: Path = Field(
+        default_factory=lambda: Path(os.environ.get("WORKSPACE_ROOT", str(ROOT)))
+    )
+
+    # ---- 运行模式开关 ----
+    # 轻量模式（同事默认）：RAG_ENABLED=false + EXEC_MODE=host
+    #   - rag_enabled=False：不做 RAG 向量检索（省掉 torch/chroma/本地模型 ≈3~5GB），
+    #     agent 用 list_files / search_code / read_file 工具自行定位代码
+    #   - exec_mode="host"：命令在本机直接执行（不依赖 Docker），每条命令人工审批
+    # 完整模式（开发者自己）：RAG_ENABLED=true（默认）+ EXEC_MODE=docker（默认，沙箱隔离）
+    rag_enabled: bool = True
+    exec_mode: str = "docker"   # "docker" | "host"
 
 
 settings = Settings()
