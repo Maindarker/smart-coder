@@ -5,84 +5,355 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>smart-coder · 代码助手</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #111418; --muted: #6b7280; --line: #d7dae0;
+    --panel: #f6f7f9; --accent: #2f6fed; --danger: #d33;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#101216; --fg:#e8eaee; --muted:#9aa2af; --line:#2b2f38;
+            --panel:#171a20; --accent:#5b8dff; --danger:#e2564f; }
+  }
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-         max-width: 860px; margin: 0 auto; padding: 16px; }
-  h1 { font-size: 20px; }
-  #workspace { color: #888; font-size: 12px; word-break: break-all; }
-  #task { width: 100%; box-sizing: border-box; height: 64px;
-          border: 1px solid #999; border-radius: 8px; padding: 8px; font: inherit; }
-  button { font: inherit; cursor: pointer; }
-  #run { margin-top: 8px; padding: 6px 18px; border-radius: 8px; border: 0;
-         background: #2f6fed; color: #fff; }
-  #run:disabled { opacity: .5; cursor: wait; }
-  #log { background: #0000000d; border-radius: 8px; padding: 12px; margin-top: 12px;
-         white-space: pre-wrap; word-break: break-word; min-height: 120px; font-size: 14px; }
-  #dialog { position: fixed; inset: 0; background: #0008; display: none;
-            align-items: center; justify-content: center; }
-  #dialog.open { display: flex; }
-  .card { background: #fff; color: #111; max-width: 560px; border-radius: 12px;
-          padding: 20px; box-shadow: 0 8px 30px #0006; }
-  .card pre { background: #f4f4f4; padding: 8px; border-radius: 8px;
+         max-width: 900px; margin: 0 auto; padding: 16px 16px 48px; background: var(--bg);
+         color: var(--fg); }
+  h1 { font-size: 18px; margin: 0; white-space: nowrap; }
+  h3 { margin: 0 0 4px; font-size: 16px; }
+  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--fg); padding: 6px 12px; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: wait; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.warn { background: var(--danger); border-color: var(--danger); color: #fff; }
+
+  /* 顶部：项目选择条 */
+  #bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+         padding-bottom: 12px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+  #proj { font: inherit; flex: 1 1 260px; min-width: 200px; padding: 7px 10px;
+          border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
+          color: var(--fg); }
+  #meta { color: var(--muted); font-size: 12px; word-break: break-all; margin-bottom: 12px;
+          line-height: 1.7; }
+  #status { display: none; margin: -4px 0 12px; font-size: 13px; color: var(--accent);
+            line-height: 1.6; }
+  #status.on { display: block; }
+  .note { font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+         border: 1px solid var(--line); background: var(--panel); margin-right: 6px; }
+  .tag.warn { color: var(--danger); border-color: var(--danger); }
+  .tag.ok { color: #17864a; border-color: #17864a55; }
+
+  #task { width: 100%; height: 72px; border: 1px solid var(--line); border-radius: 8px;
+          padding: 8px 10px; font: inherit; background: var(--panel); color: var(--fg);
+          resize: vertical; }
+  #run { margin-top: 8px; padding: 8px 20px; }
+  #log { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+         padding: 12px; margin-top: 12px; white-space: pre-wrap; word-break: break-word;
+         min-height: 140px; font-size: 14px; line-height: 1.6; }
+
+  /* 弹层通用 */
+  .overlay { position: fixed; inset: 0; background: #0008; display: none;
+             align-items: center; justify-content: center; padding: 16px; }
+  .overlay.open { display: flex; }
+  .card { background: var(--bg); color: var(--fg); width: 100%; max-width: 620px;
+          border-radius: 12px; padding: 20px; box-shadow: 0 8px 30px #0006;
+          border: 1px solid var(--line); max-height: 88vh; display: flex;
+          flex-direction: column; gap: 10px; }
+  .card pre { background: var(--panel); padding: 8px; border-radius: 8px; margin: 0;
               white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow: auto; }
-  .card button { margin-right: 8px; margin-top: 12px; padding: 8px 20px; border-radius: 8px;
-                 border: 0; color: #fff; }
-  #allow { background: #d33; }      /* 危险操作，允许按钮用警示色 */
-  #deny  { background: #666; }
+
+  /* 目录浏览 */
+  #crumb { font-size: 12px; color: var(--muted); word-break: break-all; line-height: 1.9; }
+  #crumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .row { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; }
+  .row:hover { background: var(--panel); }
+  .row .name { flex: 1; cursor: pointer; word-break: break-all; }
+  .row .name:hover { color: var(--accent); text-decoration: underline; }
+  .row button { padding: 3px 10px; font-size: 12px; }
+  #dirList { overflow: auto; flex: 1; min-height: 160px; max-height: 42vh;
+             border: 1px solid var(--line); border-radius: 8px; padding: 4px; margin: 0;
+             list-style: none; }
+  #manual { display: flex; gap: 8px; }
+  #manualPath { flex: 1; font: inherit; padding: 6px 10px; border-radius: 8px;
+                border: 1px solid var(--line); background: var(--panel); color: var(--fg); }
+  .foot { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+  .err { color: var(--danger); font-size: 13px; min-height: 18px; }
 </style>
 </head>
 <body>
-<h1>🤖 smart-coder</h1>
-<div id="workspace">工作区加载中…</div>
 
-<textarea id="task" placeholder="例如：帮我看看 src/utils 里的日期格式化函数有什么 bug"></textarea>
-<div><button id="run">运行任务</button></div>
+<div id="bar">
+  <h1>🤖 smart-coder</h1>
+  <select id="proj" title="选择要操作的工程目录"></select>
+  <button id="addBtn" class="primary" title="弹出系统原生的文件夹选择窗口">＋ 添加工程目录</button>
+  <button id="browseBtn" title="系统弹窗不可用时，在页面里逐层浏览目录">浏览…</button>
+  <button id="reloadBtn" title="刷新项目列表">⟳</button>
+</div>
+<div id="meta">加载中…</div>
+<div id="status"></div>
+
+<textarea id="task" placeholder="例如：这个项目的测试怎么跑？跑一下并修掉失败的用例"></textarea>
+<div><button id="run" class="primary">运行任务</button></div>
 <div id="log">（运行结果会显示在这里）</div>
 
-<div id="dialog">
+<!-- 危险操作审批 -->
+<div id="dialog" class="overlay">
   <div class="card">
     <h3>⚠️ 危险操作需要审批</h3>
     <div id="q"></div>
-    <button id="allow">允许执行</button>
-    <button id="deny">拒绝</button>
+    <div class="foot">
+      <button id="deny">拒绝</button>
+      <button id="allow" class="warn">允许执行</button>
+    </div>
+  </div>
+</div>
+
+<!-- 添加工程目录（系统原生弹窗不可用时的兜底：在页面里浏览） -->
+<div id="picker" class="overlay">
+  <div class="card">
+    <h3>在页面里浏览目录</h3>
+    <div class="note">正常情况下「＋ 添加工程目录」会弹出系统原生的文件夹选择窗口（体验和上传文件一样）。
+      这里是服务器没有图形界面（或通过 SSH 端口转发访问）时的替代方式，效果一样。</div>
+    <div id="crumb"></div>
+    <div id="manual">
+      <input id="manualPath" placeholder="或直接粘贴绝对路径，如 /Users/you/code/my-app">
+      <button id="goBtn">前往</button>
+    </div>
+    <ul id="dirList"></ul>
+    <div class="err" id="pickErr"></div>
+    <div class="foot">
+      <button id="pickCancel">取消</button>
+      <button id="pickHere" class="primary">添加当前目录</button>
+    </div>
   </div>
 </div>
 
 <script>
 let busy = false, es = null, taskId = null, approvalId = null;
+let projects = [], currentId = null, execMode = '', browsePath = '';
+let dialogInfo = null, currentPath = '', picking = false;
 const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-async function loadWorkspace() {
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+
+function setStatus(text) {
+  const el = $('status');
+  el.textContent = text || '';
+  el.classList.toggle('on', !!text);
+}
+
+/* ---------- 项目列表 / 切换 ---------- */
+async function loadProjects(keepLog) {
   try {
-    const j = await (await fetch('/api/workspace')).json();
-    $('workspace').textContent = '当前工作区：' + j.workspace_root
-      + (j.exists ? '' : '（目录不存在，请检查 WORKSPACE_ROOT）')
-      + '　·　换项目：改 .env 的 WORKSPACE_ROOT 后重启服务';
+    const d = await api('/api/projects');
+    projects = d.projects || [];
+    currentId = d.current;
+    execMode = d.exec_mode || '';
+    dialogInfo = d.dialog_picker || null;
+    const cur = projects.find(p => p.id === currentId);
+    currentPath = cur ? cur.path : '';
+    const sel = $('proj');
+    sel.innerHTML = projects.map(p =>
+      `<option value="${esc(p.id)}"${p.id === currentId ? ' selected' : ''}>`
+      + `${esc(p.name)}${p.exists ? '' : '（目录不存在）'} · ${esc(p.lang)}</option>`
+    ).join('');
+    $('proj').disabled = projects.length === 0;
+    // 原生弹窗不可用时，把主按钮的意思说清楚，避免用户以为按钮坏了
+    const add = $('addBtn');
+    if (dialogInfo && !dialogInfo.available) {
+      add.textContent = '＋ 添加工程目录（页面内浏览）';
+      add.title = '系统弹窗不可用：' + (dialogInfo.detail || '');
+    } else {
+      add.textContent = '＋ 添加工程目录';
+      add.title = '弹出系统原生的文件夹选择窗口';
+    }
+    renderMeta(d.current_info);
   } catch (e) {
-    $('workspace').textContent = '无法获取工作区信息';
+    $('meta').textContent = '无法获取项目列表：' + e.message;
   }
 }
 
+function renderMeta(info) {
+  if (!info) { $('meta').textContent = '还没有添加任何工程目录 —— 点「＋ 添加工程目录」开始。'; return; }
+  const parts = [
+    `<span class="tag">${esc(info.lang)}</span>`,
+    esc(info.path),
+  ];
+  if (info.test_cmd) parts.push(`测试：<code>${esc(info.test_cmd)}</code>`);
+  else parts.push('测试命令未能自动推断（可用 run_shell 指定）');
+  parts.push(`执行模式：${esc(execMode)}`);
+  let html = parts.join('　·　');
+  if (execMode === 'docker' && !['python', 'generic', 'git'].includes(info.lang)) {
+    html += `<br><span class="tag warn">⚠️ docker 沙箱只带 Python 运行时，`
+          + `${esc(info.lang)} 项目建议在 .env 里设 EXEC_MODE=host</span>`;
+  }
+  $('meta').innerHTML = html;
+}
+
+async function selectProject(id) {
+  try {
+    await api(`/api/projects/${id}/select`, { method: 'POST' });
+  } catch (e) {
+    $('meta').textContent = '切换失败：' + e.message; return;
+  }
+  await loadProjects();
+}
+
+$('proj').onchange = () => {
+  const id = $('proj').value;
+  if (id && id !== currentId) {
+    append(`\n→ 已切换到项目：${$('proj').selectedOptions[0].textContent}`);
+    selectProject(id);
+  }
+};
+$('reloadBtn').onclick = () => loadProjects();
+
+/* ---------- 添加工程目录：系统原生弹窗（像上传文件那样点选） ---------- */
+async function addViaDialog() {
+  if (picking) return;
+  // 服务器确定弹不出系统窗口（无 GUI / 远程）→ 直接走页面内浏览，不浪费一次往返
+  if (dialogInfo && !dialogInfo.available) {
+    openPicker(currentPath);
+    setStatus('当前环境不支持系统弹窗（' + (dialogInfo.detail || '') + '），已改用页面内浏览。');
+    return;
+  }
+
+  const btn = $('addBtn');
+  picking = true; btn.disabled = true;
+  setStatus('⏳ 已请求弹出系统文件夹选择窗口…请在弹出的窗口里选择目录'
+            + '（若没看到，看看是不是被浏览器窗口挡住了；最多等 3 分钟）');
+  try {
+    const d = await api('/api/dialog/directory', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initial: currentPath }),
+    });
+    if (d.ok) {
+      setStatus('');
+      await addProject(d.path);
+    } else {
+      setStatus('已取消目录选择。');
+      setTimeout(() => setStatus(''), 2500);
+    }
+  } catch (e) {
+    // 501/502/408/429：弹窗不可用或超时 → 退回页面内浏览，并说明原因
+    setStatus('系统弹窗没能用上：' + e.message);
+    openPicker(currentPath);
+  } finally {
+    picking = false; btn.disabled = false;
+  }
+}
+
+/* ---------- 页面内浏览（兜底方案 + 顺手看子项目） ---------- */
+async function openPicker(start) {
+  $('pickErr').textContent = '';
+  $('picker').classList.add('open');
+  await browse(start || '');
+}
+
+async function browse(path) {
+  $('pickErr').textContent = '';
+  try {
+    const d = await api('/api/fs' + (path ? '?path=' + encodeURIComponent(path) : ''));
+    browsePath = d.path;
+    renderCrumb(d);
+    renderDirs(d);
+  } catch (e) {
+    $('pickErr').textContent = '打开目录失败：' + e.message;
+  }
+}
+
+function renderCrumb(d) {
+  const segs = d.path.split('/').filter(Boolean);
+  let acc = '';
+  let html = '<a data-go="/">/</a>';
+  segs.forEach((s, i) => {
+    acc += '/' + s;
+    html += (i ? ' / ' : '') + `<a data-go="${esc(acc)}">${esc(s)}</a>`;
+  });
+  html += d.registered_id
+    ? ' <span class="tag ok">已在列表中</span>'
+    : (d.is_project ? ` <span class="tag">看起来是 ${esc(d.lang)} 项目</span>` : '');
+  $('crumb').innerHTML = html;
+  $('crumb').querySelectorAll('a[data-go]').forEach(a =>
+    a.onclick = () => browse(a.dataset.go));
+}
+
+function renderDirs(d) {
+  const rows = [];
+  if (d.parent) {
+    rows.push(`<li class="row"><span class="name" data-go="${esc(d.parent)}">⬆️ ..</span></li>`);
+  }
+  (d.entries || []).forEach(e => {
+    const badge = e.registered_id ? '<span class="tag ok">已添加</span>'
+      : (e.is_project ? `<span class="tag">${esc(e.lang)}</span>` : '');
+    rows.push(
+      `<li class="row">`
+      + `<span class="name" data-go="${esc(e.path)}" style="${e.hidden ? 'opacity:.55' : ''}">`
+      + `📁 ${esc(e.name)}</span>${badge}`
+      + `<button data-add="${esc(e.path)}">添加</button></li>`
+    );
+  });
+  if (!rows.length) rows.push('<li class="row"><span class="name">（没有子目录）</span></li>');
+  $('dirList').innerHTML = rows.join('');
+  $('dirList').querySelectorAll('[data-go]').forEach(el =>
+    el.onclick = () => browse(el.dataset.go));
+  $('dirList').querySelectorAll('[data-add]').forEach(el =>
+    el.onclick = () => addProject(el.dataset.add));
+}
+
+async function addProject(path) {
+  $('pickErr').textContent = '';
+  try {
+    const d = await api('/api/projects', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    $('picker').classList.remove('open');
+    setStatus('');
+    await loadProjects();
+    append(`\n→ 已添加并切换到项目：${d.project.name}（${d.project.lang}）\n  ${d.project.path}`);
+  } catch (e) {
+    if ($('picker').classList.contains('open')) {
+      $('pickErr').textContent = '添加失败：' + e.message;
+    } else {
+      setStatus('添加失败：' + e.message);
+    }
+  }
+}
+
+$('addBtn').onclick = addViaDialog;
+$('browseBtn').onclick = () => openPicker(currentPath);
+$('pickCancel').onclick = () => $('picker').classList.remove('open');
+$('pickHere').onclick = () => addProject(browsePath || $('manualPath').value.trim());
+$('goBtn').onclick = () => browse($('manualPath').value.trim());
+$('manualPath').onkeydown = e => { if (e.key === 'Enter') browse($('manualPath').value.trim()); };
+
+/* ---------- 任务执行 ---------- */
 async function submit() {
   if (busy) return;
   const task = $('task').value.trim();
   if (!task) { $('log').textContent = '请先输入任务描述。'; return; }
+  if (!currentId) { $('log').textContent = '请先添加一个工程目录。'; return; }
 
   busy = true; $('run').disabled = true;
   $('log').textContent = '任务已提交，等待执行…\n';
 
   try {
-    const r = await fetch('/api/tasks', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ task }) });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      $('log').textContent = '❌ 提交失败：' + (err.detail || r.statusText);
-      finish(); return;
-    }
-    taskId = (await r.json()).task_id;
+    const r = await api('/api/tasks', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task, project_id: currentId }),
+    });
+    taskId = r.task_id;
   } catch (e) {
-    $('log').textContent = '❌ 无法连接服务：' + e;
+    $('log').textContent = '❌ 提交失败：' + e.message;
     finish(); return;
   }
 
@@ -92,9 +363,9 @@ async function submit() {
     try { ev = JSON.parse(e.data); } catch { return; }
     if (ev.type === 'approval') {
       approvalId = ev.approval_id;
-      $('q').innerHTML = '<p>' + escapeHtml(ev.question) + '</p>'
-        + '<p>工具：<code>' + escapeHtml(ev.tool || '-') + '</code></p>'
-        + '<pre>' + escapeHtml(JSON.stringify(ev.args, null, 2)) + '</pre>';
+      $('q').innerHTML = '<p>' + esc(ev.question) + '</p>'
+        + '<p>工具：<code>' + esc(ev.tool || '-') + '</code></p>'
+        + '<pre>' + esc(JSON.stringify(ev.args, null, 2)) + '</pre>';
       $('dialog').classList.add('open');
     } else if (ev.type === 'done') {
       append('\n━━━ 完成 ━━━\n' + ev.result + '\n' + ev.cost);
@@ -128,15 +399,11 @@ function append(text) {
   log.scrollTop = log.scrollHeight;
 }
 function finish() { busy = false; $('run').disabled = false; }
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
 
 $('run').onclick = submit;
 $('allow').onclick = () => decide(true);
 $('deny').onclick = () => decide(false);
-loadWorkspace();
+loadProjects();
 </script>
 </body>
 </html>

@@ -19,6 +19,8 @@
 9. [危险操作审批：interrupt 人机协同](#九危险操作审批)
 10. [测试与验证实录](#十测试与验证实录)
 11. [经验总结与踩坑清单](#十一经验总结与踩坑清单)
+12. [支持任意项目：多项目工作区](#十二支持任意项目多项目工作区)
+13. [Web 界面：项目管理与人工审批](#十三web-界面项目管理与人工审批)
 
 ---
 
@@ -302,6 +304,10 @@ class Settings(BaseSettings):
 settings = Settings()
 ```
 
+> 📌 **后续演进（见第十二节）**：`workspace_root` 已降级为**回退值**。要支持"界面上随时添加/切换
+> 任意项目"，工作区就不能是 import 时快照的常量 —— 现在由 `workspace.py` 在运行期解析：
+> `contextvar（当前任务绑定）> 注册表 current（界面选中）> workspace_root（回退）`。
+
 对应根目录下创建 `.env`：
 
 ```ini
@@ -473,6 +479,11 @@ def run_test(path: str = ".") -> str:
     r = run_command("python -m pytest -q", cwd=f"/workspace/{path}", timeout=180)
     return 格式化结果(r)
 ```
+
+> 📌 **后续演进（见第十二节）**：`run_test` 不再写死 pytest，改为按项目类型自动选命令
+> （`npm test` / `go test ./...` / `cargo test` / `mvn test` / `make test` / pytest…），
+> 并支持 `command` 参数显式覆盖；`_safe_path` 的边界也从固定 `workspace_root` 改为
+> 运行期解析的当前项目目录。
 
 ### 6.5 🕳️ 连环坑与解决记录（重点）
 
@@ -687,6 +698,10 @@ app.invoke(state, config={"configurable": {"thread_id": "会话A"}})
 app.invoke(state, config={"configurable": {"thread_id": "会话B"}})   # 隔离
 ```
 
+> 📌 **后续演进（见第十二节）**：`checkpoints.sqlite` 已从"工作区目录下"移到 **agent 自己目录**
+> （避免污染被协助的代码库），并靠 `thread_id` 前缀（`项目id::会话id`）实现项目级隔离。
+> 单项目时代的旧会话会在首次启动时自动加上默认项目前缀（一次性迁移，见 `workspace.migrate_legacy_state`）。
+
 > `.agent_cache/`、`chroma/` 都是运行时产物，记得进 `.gitignore`。
 
 ### 8.4 长期记忆：会话历史 + 偏好文件
@@ -697,6 +712,9 @@ checkpoint 只负责"落盘状态"，本身并不会"记住用户说过的话"�
 | -------- | --------------------------------- | ------------------------------------------------ | ---------------------- |
 | 会话历史 | `State.messages`（`add_messages`） | 随 checkpoint 持久化，每轮追加用户话 / 助手答    | 同线程内回放上下文     |
 | 长期偏好 | `.agent_cache/memory.md`          | `remember_fact` 写入、`recall_memory` 查询       | 跨线程可召回事实/偏好  |
+
+> 📌 **后续演进（见第十二节）**：记忆文件改为按项目隔离的
+> `.agent_cache/projects/<项目id>/memory.md`，"记住我的偏好"不会再跨项目串味。
 
 - 每次运行 `main.py` 只把新提问以 `HumanMessage` 追加进 `messages`，最终答复以 `AIMessage` 写回，不会覆盖历史。
 - "记住 xx / 我偏好 xx"这类任务，`execute` 节点会调 `remember_fact` 落盘；询问时先 `recall_memory` 再作答，不靠猜。
@@ -1028,25 +1046,256 @@ agent_env/                  ← 本身是 Python venv
 ├── .env                    # API Key、模型分工、HF 配置（已 gitignore）
 ├── .gitignore
 ├── config.py               # Settings + get_llm() + HF_* 环境变量
-├── tools.py                # list_files / read_file / run_shell / run_test
-├── sandbox.py              # docker-py 封装：沙箱命令执行
-├── rag.py                  # 代码索引 + 混合检索 + 重排
+├── workspace.py            # 多项目注册表 + 运行期工作区解析 + 语言识别 + 共享文件遍历
+├── tools.py                # list_files / read_file / search_code / describe_project
+│                           #   + run_shell / run_test（按语言自动选命令）+ 记忆工具
+├── sandbox.py              # 命令执行：host 本机直跑（默认）/ docker 沙箱
+├── rag.py                  # 代码索引（多语言）+ 混合检索 + 重排，按项目隔离
 ├── agent.py                # StateGraph：plan→retrieve→execute→reflect→finish
-├── main.py                 # CLI 入口 + 审批循环
-├── Dockerfile.sandbox      # 沙箱镜像（python:3.11-slim + git + pytest）
-├── code_agent_dev_guide.md # 本文档
+├── engine.py               # 任务引擎：绑定工作区 + 审批循环 + 事件回调（CLI/Web 共用）
+├── cost.py                 # LLM 成本统计（contextvar 按任务分账）
+├── main.py                 # CLI 入口（--project= 可指定任意项目）
+├── webapp.py               # FastAPI 服务：项目增删切换 + 系统弹窗/目录浏览 + SSE 任务流
+├── dirpicker.py            # 系统原生"选择文件夹"弹窗（macOS/Linux/Windows）
+├── web/index.html          # 前端：项目下拉框 + 添加工程目录（系统弹窗）+ 审批弹窗
+├── run-web.sh              # 一键启动
+├── Dockerfile.sandbox      # 沙箱镜像（python:3.11-slim + git + pytest，仅 Python 项目用）
+├── md/                     # 使用/维护文档（gitignore）
 ├── .cache/huggingface/     # 本地模型权重（gitignore）
-├── chroma/                 # 向量库（gitignore）
-└── .agent_cache/           # checkpoint sqlite（gitignore）
+├── chroma/                 # ⚠️ 旧版遗留向量库（新版写 .agent_cache/projects/<id>/chroma）
+└── .agent_cache/           # agent 自己的状态（gitignore）
+    ├── projects.json       #   项目清单（界面上添加的目录都记在这）
+    ├── checkpoints.sqlite  #   所有项目的会话历史，靠 thread_id 前缀隔离
+    └── projects/<项目id>/  #   每个项目的 memory.md 与 chroma/（互不污染）
+```
+
+---
+
+## 十二、支持任意项目：多项目工作区
+
+最初这个 Agent 的假设是"操作 Python 代码库"，要辅助别的语言得改好几处硬编码。
+落地时换了个更彻底的做法：**不针对某种语言做适配，而是把"工作区"从启动时常量
+升级为运行时可切换的值，并让语言/测试命令自动识别**。这样任意语言、任意目录都能用。
+
+### 12.1 原来有哪 5 处语言/单项目假设
+
+| # | 位置 | 原来的假设 | 现在 |
+| --- | --- | --- | --- |
+| 1 | `rag.py` | `root.rglob("*.py")`，只索引 Python | 多语言后缀集合（js/ts/vue/go/rs/java/c/cpp/… + 配置文档），统一走 `workspace.iter_files` |
+| 2 | `tools.py` `run_test` | 写死 `python -m pytest` | 按清单文件自动推断测试命令，支持 `command` 覆盖 |
+| 3 | `Dockerfile.sandbox` | 只有 Python 运行时 | 默认执行模式改为 `EXEC_MODE=host`（任意语言可用）；docker 保留给 Python 项目强隔离 |
+| 4 | `tools.py` / `rag.py` 的 skip 集合 | 把 `bin/lib/include/share` 当成虚拟环境目录整个跳过 | 只有工作区根**本身是 venv** 时才跳这些名字（见 12.3） |
+| 5 | `config.py` + `tools/agent/rag` 的模块级常量 | `workspace_root` import 时快照，不可变 | `workspace.py` 运行期解析 + contextvar 按任务绑定 |
+
+### 12.2 架构：工作区怎么"活"起来
+
+```
+config.settings.workspace_root          ← 只是回退值（一个项目都没添加时兜底）
+        ▲
+        │  workspace.current() 解析顺序
+        │
+   ┌────┴─────────────────────────────────────────┐
+   │ 1. contextvar（engine.run_task 用 bind() 绑）  │  ← 每个任务线程独立，天然并发安全
+   │ 2. 注册表 current（界面上选中的项目）           │
+   │ 3. settings.workspace_root（回退）             │
+   └──────────────────────────────────────────────┘
+```
+
+- **为什么必须 contextvar**：Web 端 `MAX_RUNNING=4`，4 个任务可并发。如果只是"改个全局变量"
+  来表示当前项目，两个任务跑不同项目就会互相串。contextvar 按线程隔离，
+  正好对上"每个任务一个线程"的模型，不用加锁。
+- **为什么 checkpointer 不用重建**：所有项目共用一个 `checkpoints.sqlite`，
+  `thread_id` 加项目前缀（`项目id::会话id`）即可隔离，`app` 依然是 import 时编译一次。
+- **成本统计也按任务分账**：`cost.tracker` 改成 contextvar 感知的代理
+  （`tracker.session()`），否则并发任务的 token 会混在一起。
+
+### 12.3 顺手修掉的两个隐藏 bug
+
+**① skip 集合误伤源码目录。** 原 skip 集合含 `bin/lib/include/share/site-packages`
+—— 那是"本仓库自己就是 venv"的历史包袱。对 Go/C/C++/Rust 项目，`include/`、`lib/`、`bin/`
+是**真实源码目录**，会被静默整个跳过，搜索直接漏结果。现在的规则：
+
+```
+工作区根有 pyvenv.cfg（本身就是 venv）→ 额外跳过 bin/lib/include/share/Scripts
+任意位置的 .venv/venv（含 pyvenv.cfg）→ 跳过整个目录
+其他项目                          → bin/lib/include 照常搜索
+```
+
+**② RAG 索引不跟项目走。** BM25 与 chunk 元数据是进程级单例，界面切换项目后
+如果不重建，检索会把**上一个项目**的代码片段塞进 prompt。现在索引与项目 id 绑定
+（切项目必定重建），并按 `REINDEX_TTL`(30s) + 文件指纹自动跟随文件变动
+（`RAG_AUTO_REINDEX=true`）。
+
+### 12.4 状态不再写进用户仓库
+
+| | 改造前 | 改造后 |
+| --- | --- | --- |
+| checkpoint | `<工作区>/.agent_cache/checkpoints.sqlite` | `<agent>/.agent_cache/checkpoints.sqlite`（thread_id 带项目前缀） |
+| 长期记忆 | `<工作区>/.agent_cache/memory.md`（全局一份） | `<agent>/.agent_cache/projects/<项目id>/memory.md` |
+| 向量库 | `<工作区>/chroma/` | `<agent>/.agent_cache/projects/<项目id>/chroma/` |
+| 项目清单 | 无（只有 `.env` 里一个 `WORKSPACE_ROOT`） | `<agent>/.agent_cache/projects.json` |
+
+被协助的代码库里**不会再出现 `.agent_cache/` 或 `chroma/`**。
+升级时旧数据会自动"认领"到默认项目名下（一次性、幂等，见
+`workspace.migrate_legacy_state()`）：记忆文件搬过去、裸 `thread_id`（`main`/`me`…）
+加上项目前缀，旧会话历史继续可用。
+
+### 12.5 项目识别：让 agent 自己搞清"这是什么项目"
+
+新增 `describe_project` 工具（和 `/api/projects/<id>/describe` 接口），
+返回语言、清单文件、源码后缀直方图、自动推断的测试命令、`package.json` scripts、
+Makefile targets、README 摘要。plan 与 execute 节点每次都把这份**项目简报**注入 prompt，
+所以 agent 不会对着 Go 项目猜"用 pytest 跑一下"。
+
+识别优先级：清单文件（`package.json`/`go.mod`/`Cargo.toml`/`pyproject.toml`…）
+→ 若声明语言没有源码，则按后缀直方图纠正（例如只有 `.ts` 却漏了 `package.json`）。
+
+测试命令推断表：
+
+| 项目类型 | 判定依据 | 命令 |
+| --- | --- | --- |
+| node | `package.json` 有 `scripts.test` | `npm test` |
+| python | `tests/` 或 `test_*.py` 或 `pyproject.toml` | `python -m pytest -q` |
+| go | `go.mod` | `go test ./...` |
+| rust | `Cargo.toml` | `cargo test` |
+| java | `pom.xml` / `gradlew` | `mvn -q test` / `./gradlew test` |
+| ruby | `Gemfile` | `bundle exec rspec` |
+| dotnet | `*.csproj` / `*.sln` | `dotnet test` |
+| 其他 | `Makefile` 里有 `test`/`check`/`ci` | `make test` |
+| 兜底 | — | 返回提示，让模型用 `run_shell` 显式指定 |
+
+### 12.6 实测（非 Python 项目端到端）
+
+用一个离线可跑的 Node fixture（`npm test` → `node test/run.js`，且故意留了个 bug）验证：
+
+```
+[提交] task_id=7ab4… project=node-demo-2c642f9c workspace=/private/tmp/…/node-demo
+[日志] 项目：/private/tmp/…/node-demo（node，测试命令：npm test）
+[审批#1] 工具=run_test 原因=轻量模式（无 Docker 沙箱）：命令在本机直接执行
+         参数={"path": "."}   → 已自动批准
+===== 任务完成 =====
+项目是 Node.js（ESM），测试命令为 `npm test`（实际执行 `node test/run.js`）。
+运行测试后 1 个用例失败：`add(2,3)` 期望 5，实际 -1。
+原因是 `src/math.js` 第 2 行把加法写成了减法 `return a - b;`。建议改为 `return a + b;`
+----- 成本 ----- 合计: 9 次调用, 21096 tokens
+```
+
+验证到位的点：任务绑定到非 Python 项目、`run_test` 自动选 `npm test`、
+host 模式逐条审批经 HTTP 往返恢复执行、多语言 RAG 确实索引了 `.js`
+（chroma 里是 `package.json` / `src/math.js` / `test/run.js` 三个 chunk）、
+被协助的目录里**没有**多出任何 agent 文件。
+
+---
+
+## 十三、Web 界面：项目管理与人工审批
+
+界面（`web/index.html` + `webapp.py`）不再只是"输入任务 + 看结果"，顶部多了一条项目栏：
+
+```
+🤖 smart-coder   [ 项目下拉框 ▾ ]   [＋ 添加工程目录]  [浏览…]  [⟳]
+node · /Users/you/code/my-app · 测试：npm test · 执行模式：host
+```
+
+### 13.1 「添加工程目录」为什么必须由服务端弹窗
+
+直觉方案是用浏览器的目录选择能力（`<input type="file" webkitdirectory>` 或
+`showDirectoryPicker()`），做得跟"上传文件"一样。**但这条路拿不到可用路径**：
+出于安全设计，浏览器只暴露文件名/相对路径，**绝不暴露绝对路径**，
+后端拿不到"要操作哪个目录"这个最关键的信息 —— 那正是这个 Agent 的立身之本。
+
+好在部署形态帮了忙：本服务只监听 `127.0.0.1`，**浏览器与后端在同一台机器**。
+于是改成由**服务端进程**去弹操作系统原生的文件夹选择窗口（新增 `dirpicker.py`）：
+
+| 平台 | 命令 | 体验 |
+| --- | --- | --- |
+| macOS | `osascript` → `choose folder` | Finder 风格原生窗口，返回 POSIX 绝对路径 |
+| Linux | `zenity --file-selection --directory`（退回 `kdialog`） | GTK 原生窗口 |
+| Windows | PowerShell `FolderBrowserDialog` | 系统文件夹对话框 |
+
+两边都满足：用户看到的是自己系统熟悉的"选文件夹"窗口，服务端拿到的是真实绝对路径。
+
+**几个必须处理的细节**（都是实测踩出来的）：
+
+- **取消不能当报错**：macOS 取消返回 `-128`、zenity 取消是静默 `exit 1`，
+  都按 `canceled` 处理；但**只有 `rc==1 且没有任何 stderr` 才算取消** ——
+  真正的失败一定会在 stderr 留信息（例如 `-1743` 未授权 Apple Events），
+  无脑把 `rc==1` 当取消会把失败静默吞掉、界面毫无反应。
+- **超时要分两层**：弹窗自己带超时（AppleScript `with timeout of N seconds`），
+  触发时错误码是 `-1712`，要单独识别成"等待超时"；`subprocess` 的 timeout 只做最后兜底
+  （多留 15s），防止某个平台的对话框完全不响应时把 HTTP 请求永久挂死。
+- **只允许一个弹窗**：连点按钮不该弹出一堆窗口，用锁挡住并返回 `429`。
+- **`rc=0` 却没有输出**：说明选择器被中断，明确报错而不是返回一个空路径。
+- **别用 `tell me to activate` 抢焦点**：`me` 指的就是 `osascript` 自己，而它是
+  `BackgroundOnly` 进程、**永远进不了前台**，系统会一直等它变前台等到约 **2s** 激活超时
+  才继续 —— 实测「spawn 到即将弹出面板」由 `0.1s` 变成 `2.0~2.3s`（18 次稳定复现），
+  而这 2s 毫无收益（面板打开期间 LaunchServices 的前台应用始终没变，面板该在前台就在前台）。
+  所以默认不执行它；个别机器上真被浏览器挡住时，设 `SMARTCODER_PICK_DIR_ACTIVATE=1` 换回旧行为。
+- **请求耗时 = 面板 + 人手时间**：这个接口是**同步阻塞**的（挂到用户选完/取消，最多 180s），
+  所以浏览器 DevTools 里它总是显示几秒 —— 那不是服务端慢：接口自身的处理
+  （锁 + `normalize_dir` + `describe_project(deep=False)`）实测只有 **8～17ms**，
+  时间全花在原生面板上。
+- **选完立刻校验**：复用添加项目那套规则（绝对路径、存在、是目录、非根目录、可读），
+  非法路径在加入列表前就被拒绝。
+
+### 13.2 兜底：页面内浏览
+
+服务器没有图形界面（容器/无头）或通过 SSH 端口转发访问时，系统弹窗会开在服务器那台机器上，
+用户根本看不到。所以保留了**页面内浏览**（`GET /api/fs`）作为替代路径：
+
+- 前端启动时读 `/api/health` 的能力探测，若确定弹不出窗口，主按钮直接走页面内浏览并说明原因；
+- 弹窗失败/超时（`501/502/408`）时自动切到页面内浏览，并把原因显示出来；
+- 也可以在弹窗不可用时点「浏览…」手动进入。
+
+页面内浏览会逐层列出目录，并标注哪些"看起来是 node/go/python 项目"（命中清单文件）、
+哪些"已添加"；还支持直接粘贴绝对路径跳转。
+
+### 13.3 接口一览
+
+| 接口 | 作用 |
+| --- | --- |
+| `POST /api/dialog/directory` | 弹**系统原生**文件夹选择窗口，返回校验过的绝对路径（阻塞至选完/取消/超时） |
+| `GET /api/projects` | 项目列表 + 当前选中 + 项目简报 + 执行模式 + 弹窗能力探测 |
+| `POST /api/projects` | 添加目录 `{path, name?}`（同路径幂等，自动切为当前） |
+| `POST /api/projects/{id}/select` | 切换当前项目 |
+| `DELETE /api/projects/{id}` | 从列表移除（**不动磁盘数据**） |
+| `GET /api/projects/{id}/describe` | 深度识别：语言/测试命令/源码构成/README |
+| `GET /api/fs?path=/abs` | 页面内目录浏览（兜底方案，只列目录并标注是否像项目） |
+| `GET /api/workspace` | 当前工作区（旧接口，保留兼容） |
+| `POST /api/tasks` | 提交任务，带 `project_id`（**提交时绑定**，之后切项目不影响在跑的任务） |
+| `GET /api/tasks/{id}/events` | SSE：`log` / `approval` / `done` / `error` / `close` |
+| `POST /api/tasks/{id}/approve` | 审批回复，唤醒引擎线程 |
+
+安全边界：路径必须是**存在的绝对路径**，拒绝 `/`、相对路径、文件路径与不可读目录；
+文件读写工具始终被限制在**当前项目目录**内（`_safe_path` 越界即拒绝）。
+
+自动化测试（无头环境）可以用环境变量把弹窗替换成一个命令：
+
+```bash
+SMARTCODER_PICK_DIR_CMD='echo /tmp/my-project' python -m uvicorn webapp:app
+```
+
+macOS 上如果发现系统面板被浏览器窗口挡住（默认不再调用 `tell me to activate`，因为它会白等约 2 秒），
+可以用开关换回带抢焦点的旧行为：
+
+```bash
+SMARTCODER_PICK_DIR_ACTIVATE=1 python -m uvicorn webapp:app
+```
+
+命令行同样支持任意项目：
+
+```bash
+python main.py "这个项目怎么跑测试？跑一下"                     # 用界面里最后选中的项目
+python main.py "跑一下测试" --project=/Users/you/code/my-app    # 登记并切换到该目录
 ```
 
 ---
 
 ## 后续展望
 
+- [ ] **文件写入/编辑工具**：目前只有读工具 + `run_shell`，改代码得靠 shell 命令（如 sed），
+      "修 bug"类任务不趁手；加 `write_file` / `apply_patch` 会明显提升实用性
+- [ ] 多语言沙箱镜像：按项目类型选镜像（`node:20-slim` / `golang` / `rust`），兼顾隔离与通用
 - [ ] AST 感知的代码切分（按函数/类），提升检索精度
-- [ ] RAG 索引的更新策略
-- [ ] 适配非python项目，比如前端项目接入该Agent
-- [ ] 长期用户偏好记忆（Sqlite 存配置，跨会话生效）
+- [ ] 并行任务的资源配额（`MAX_RUNNING=4`，单个任务会占用多轮 LLM 调用）
 - [ ] Git 操作的专属工具（而非裸 `git` 命令 + 审批）
-- [ ] Web 界面（FastAPI/前端壳）替代 CLI
+- [ ] 项目级配置记忆（例如"这个项目测试要加 `--experimental-vm-modules`"写进 projects.json）

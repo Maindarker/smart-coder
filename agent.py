@@ -1,14 +1,17 @@
 """LangGraph 有状态代码助手：plan -> retrieve -> execute -> reflect -> finish。
 
+语言/项目无关：工作区由 workspace.py 在运行时决定（界面里可随时添加/切换项目），
+每个任务在自己线程里绑定工作区，所以并发跑不同项目也不会串。
+
 - plan：Pro 模型（thinking 开）产出步骤计划
-- retrieve：RAG 混合检索（向量+BM25+重排），注入相关代码上下文
-- execute：Flash 模型 + 工具调用（文件读写 + Docker 沙箱命令/测试）
+- retrieve：RAG 混合检索（向量+BM25+重排），注入相关代码上下文（按项目隔离的索引）
+- execute：Flash 模型 + 工具调用（文件读写 + 项目识别 + 命令/测试）
   - 危险操作（rm -rf / git push / sudo / 联网命令等）触发 interrupt() 人工审批
 - reflect：Pro 模型结构化输出（thinking 关），判断是否完成
 - finish：Pro 模型总结汇报
-- 记忆（两层）：
+- 记忆（两层，均存放在 agent 自己目录、按项目隔离，不污染用户仓库）：
   - 会话历史：State.messages（add_messages reducer）随 checkpoint 持久化，跨运行回放对话
-  - 长期偏好：remember_fact / recall_memory 工具落盘 .agent_cache/memory.md，跨会话可查
+  - 长期偏好：remember_fact / recall_memory 工具落盘 projects/<项目id>/memory.md，跨会话可查
 """
 import re
 import sqlite3
@@ -24,6 +27,7 @@ from pydantic import BaseModel, Field
 from config import settings, get_llm
 from tools import TOOLS
 from rag import retrieve
+import workspace
 
 MAX_ITERATIONS = 5   # 防死循环：plan/execute/reflect 全局循环上限
 MAX_TOOL_ROUNDS = 4  # 单次 execute 内最多工具往返次数
@@ -70,6 +74,19 @@ def _history_text(state: AgentState) -> str:
     return "\n".join(lines[-16:]) or "（无历史）"
 
 
+def _project_brief() -> str:
+    """当前项目简报（路径/语言/测试命令）。每次都实时解析，所以切换项目后立刻正确。"""
+    try:
+        info = workspace.describe_project(workspace.current(), deep=False)
+        line = f"当前项目：{info['path']}\n语言：{info['lang']}"
+        if info.get("manifests"):
+            line += f"（清单：{', '.join(info['manifests'])}）"
+        line += f"\n测试命令：{info.get('test_cmd') or '（未能推断，改用 run_shell 显式指定）'}"
+        return line
+    except Exception as e:  # noqa: BLE001 —— 简报失败不该阻断任务
+        return f"当前项目：{workspace.current()}（识别失败：{e}）"
+
+
 def _danger_check(tc: dict) -> str | None:
     """判断一次工具调用是否危险，返回风险说明；不危险返回 None。"""
     if tc.get("name") != "run_shell":
@@ -88,8 +105,10 @@ def plan(state: AgentState) -> dict:
     llm = get_llm(settings.planner_model, thinking=True)
     msg = llm.invoke([
         SystemMessage("你是资深代码助手。针对任务给出简洁、可执行的步骤计划，直接列步骤。"
+                      "项目可能是任意语言/技术栈，不要假设是 Python；不确定项目结构时，"
+                      "计划里应先安排用工具了解项目（describe_project / list_files）。"
                       "若任务涉及用户偏好或历史事实，先结合对话历史/记忆作答。"),
-        HumanMessage(f"任务：{state['task']}\n对话历史：\n{_history_text(state)}\n"
+        HumanMessage(f"任务：{state['task']}\n{_project_brief()}\n对话历史：\n{_history_text(state)}\n"
                      f"上一轮反馈：{state.get('feedback') or '无'}"),
     ])
     return {"plan": msg.content, "iterations": state.get("iterations", 0) + 1}
@@ -113,17 +132,21 @@ def retrieve_node(state: AgentState) -> dict:
 
 def execute(state: AgentState) -> dict:
     llm = get_llm(settings.executor_model, thinking=False).bind_tools(TOOLS)
-    hint = ("（未启用 RAG。定位代码请先用 list_files / search_code / read_file 工具，"
-            "不要凭空猜路径。）" if not settings.rag_enabled else "（无相关代码上下文）")
+    hint = ("（未启用 RAG。定位代码请先用 describe_project / list_files / search_code / read_file 工具，"
+            "不要凭空猜路径，也不要假设项目是 Python。）" if not settings.rag_enabled
+            else "（无相关代码上下文）")
     ctx = state.get("context") or hint
     msgs = [
         SystemMessage(
             "你是执行器。用工具完成任务，最后用一句中文总结执行结果。可参考相关代码上下文。"
+            "项目可能是任意语言/技术栈：先描述项目再动手，跑测试用 run_test（会自动选命令），"
+            "需要别的构建/包管理命令时用 run_shell。不要凭空猜文件路径。"
             "若任务涉及『记住/询问用户偏好或事实』：要记住时调用 remember_fact 写入长期记忆；"
             "要查询时先调用 recall_memory 读取记忆再回答，不要凭空猜测。"
         ),
         HumanMessage(
-            f"任务：{state['task']}\n计划：{state['plan']}\n对话历史：\n{_history_text(state)}\n"
+            f"任务：{state['task']}\n{_project_brief()}\n计划：{state['plan']}\n"
+            f"对话历史：\n{_history_text(state)}\n"
             f"反馈：{state.get('feedback') or '无'}\n相关代码上下文：\n{ctx}"
         ),
     ]
@@ -216,9 +239,10 @@ graph.add_edge("execute", "reflect")
 graph.add_conditional_edges("reflect", route, {"execute": "execute", "finish": "finish"})
 graph.add_edge("finish", END)
 
-# 会话记忆：checkpoint 持久化到项目内 sqlite，按 thread_id 做会话隔离（.agent_cache 已在 .gitignore）
-# 长期偏好：由 remember_fact / recall_memory 工具落盘 .agent_cache/memory.md（见 tools.py）
-CHECKPOINT_DB = settings.workspace_root / ".agent_cache" / "checkpoints.sqlite"
+# 会话记忆：checkpoint 持久化到【agent 自己目录】的 sqlite（不再写进被操作的用户仓库），
+# 一个 sqlite 承载所有项目，靠 thread_id 的项目前缀隔离（见 workspace.thread_key）。
+# 长期偏好：由 remember_fact / recall_memory 工具落盘到按项目隔离的 memory.md（见 tools.py）
+CHECKPOINT_DB = workspace.CHECKPOINT_DB
 CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
 _conn = sqlite3.connect(str(CHECKPOINT_DB), check_same_thread=False)
 checkpointer = SqliteSaver(_conn)

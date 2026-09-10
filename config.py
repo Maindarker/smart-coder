@@ -34,21 +34,29 @@ class Settings(BaseSettings):
     planner_model: str = "deepseek-v4-pro"    # 规划 / 反思用强推理模型
     executor_model: str = "deepseek-v4-flash"  # 执行 / 工具调用用快模型
 
-    # 安全：agent 只允许在这个目录内读写文件。
-    # 默认 = agent 自身目录；设置 WORKSPACE_ROOT 环境变量后，可指向任意用户代码库
-    # （本机 Web 形态的关键开关：每个使用者把 WORKSPACE_ROOT 填成自己的项目路径）。
+    # 默认工作区（**回退值**，不是唯一工作区）。
+    # 支持任意项目后，真正"当前操作哪个代码库"由 workspace.py 在运行期决定：
+    #   contextvar（任务绑定）> 注册表 current（界面里选中的项目）> 这里的回退值
+    # 所以这里只在"一个项目都还没添加、也没有注册表"时兜底，默认 = agent 自身目录。
     workspace_root: Path = Field(
         default_factory=lambda: Path(os.environ.get("WORKSPACE_ROOT", str(ROOT)))
     )
 
     # ---- 运行模式开关 ----
-    # 轻量模式（同事默认）：RAG_ENABLED=false + EXEC_MODE=host
-    #   - rag_enabled=False：不做 RAG 向量检索（省掉 torch/chroma/本地模型 ≈3~5GB），
-    #     agent 用 list_files / search_code / read_file 工具自行定位代码
-    #   - exec_mode="host"：命令在本机直接执行（不依赖 Docker），每条命令人工审批
-    # 完整模式（开发者自己）：RAG_ENABLED=true（默认）+ EXEC_MODE=docker（默认，沙箱隔离）
+    # 默认 host（任意项目）：命令在本机直接执行，不假设语言，每条命令人工审批。
+    #   - exec_mode="host"：无容器隔离，安全靠 agent.py 的逐条审批兜底；
+    #     任意语言的项目（node/go/rust/…）都能直接跑，无需为每种语言建镜像。
+    #   - exec_mode="docker"：命令在非 root 沙箱容器内执行、默认断网，
+    #     但沙箱镜像目前只带 Python 运行时（见 Dockerfile.sandbox），
+    #     跑非 Python 项目需要在 .env 里改回 host 或自行扩展镜像。
+    # rag_enabled=False 时不做 RAG 向量检索（省掉 torch/chroma/本地模型 ≈3~5GB），
+    # agent 改用 list_files / search_code / read_file 工具自行定位代码。
     rag_enabled: bool = True
-    exec_mode: str = "docker"   # "docker" | "host"
+    exec_mode: str = "host"   # "host"（默认，任意项目） | "docker"（Python 项目强隔离）
+
+    # RAG 索引是否自动跟随文件变动重建（按 REINDEX_TTL 间隔检测，见 rag.py）。
+    # 关闭后索引只在首次/切换项目时建立，适合超大仓库。
+    rag_auto_reindex: bool = True
 
 
 settings = Settings()

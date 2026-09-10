@@ -2,8 +2,16 @@
 
 通过 LangChain callback 在每次 LLM 结束时自动累计，无需侵入各节点代码。
 金额估算：可在 PRICING 里按模型填每百万 token 价格（元），留空则不显示金额。
+
+并发分账：支持任意项目后，同一进程会并发跑不同项目的任务。如果统计器是纯全局
+单例，两个任务的 token 会混在一起、summary 也会互相覆盖。所以对外暴露的
+`tracker` 是一个 contextvar 感知的代理：engine.run_task 用 tracker.session()
+为每个任务开独立计数器（contextvar 按线程隔离，正好对上 TasksHandle 的线程模型）。
 """
 from __future__ import annotations
+
+import contextlib
+import contextvars
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
@@ -68,4 +76,37 @@ class CostTracker(BaseCallbackHandler):
 
 
 # 全局单例：config.get_llm() 会把它挂到每个 LLM 上，整次运行自动累计
-tracker = CostTracker()
+class _TrackerProxy(BaseCallbackHandler):
+    """contextvar 感知的统计代理：任务内用独立计数器，任务外用共享计数器。
+
+    必须是 BaseCallbackHandler 的子类 —— LangChain 只对 BaseCallbackHandler
+    实例派发 on_llm_end，普通代理对象事件会被丢掉。
+    """
+
+    _local: contextvars.ContextVar = contextvars.ContextVar("cost_tracker", default=None)
+    _shared: "CostTracker" = CostTracker()
+
+    def _t(self) -> "CostTracker":
+        return self._local.get() or self._shared
+
+    def on_llm_end(self, response: LLMResult, **kwargs) -> None:
+        self._t().on_llm_end(response, **kwargs)
+
+    def reset(self) -> None:
+        self._t().reset()
+
+    def summary(self) -> str:
+        return self._t().summary()
+
+    @contextlib.contextmanager
+    def session(self):
+        """在当前上下文里开一份独立计数器（engine.run_task 每个任务调用一次）。"""
+        fresh = CostTracker()
+        token = self._local.set(fresh)
+        try:
+            yield fresh
+        finally:
+            self._local.reset(token)
+
+
+tracker = _TrackerProxy()

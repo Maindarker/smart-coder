@@ -1,10 +1,15 @@
-"""命令执行层：Docker 沙箱（完整模式）或本机直跑（轻量模式，无 Docker）。
+"""命令执行层：Docker 沙箱（强隔离模式）或本机直跑（默认，任意项目）。
 
 模式由 config.EXEC_MODE 决定：
-- "docker"（默认，完整模式）：命令在非 root 沙箱容器内执行，默认断网、限时限内存，
-  工作区以 /workspace 挂载进容器。docker Python 库缺失或守护进程不可用时自动回退 host。
-- "host"（轻量模式，同事机器默认）：命令直接在本机用 bash 执行，继承当前环境；
+- "host"（默认）：命令直接在本机用 bash 执行，继承当前环境，不假设语言。
   安全性由"每条命令人工审批"（agent.py 的 interrupt）+ 危险模式拦截兜底。
+- "docker"：命令在非 root 沙箱容器内执行，默认断网、限时限内存，
+  当前工作区以 /workspace 挂载进容器。docker Python 库缺失或守护进程不可用时
+  自动回退 host。注意沙箱镜像目前只带 Python 运行时（Dockerfile.sandbox），
+  跑非 Python 项目请用 host 模式或自行扩展镜像。
+
+工作区是运行时可变的（workspace.py）：挂载源与 host 侧 cwd 都在调用时解析，
+所以同一个服务进程里并发跑不同项目、切换项目都不会串。
 
 两种模式返回统一的 dict：{exit_code, stdout, stderr, timed_out}。
 """
@@ -15,6 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import workspace
 from config import settings, ROOT
 
 SANDBOX_IMAGE = "smart-coder-sandbox:latest"
@@ -113,7 +119,8 @@ def _run_docker(
         network_disabled=not network,
         detach=True,
         tty=False,
-        volumes={str(settings.workspace_root): {"bind": CONTAINER_WORKDIR, "mode": "rw"}},
+        # 挂载【当前】工作区（运行时可切换的项目目录），而不是启动时那个
+        volumes={str(workspace.current()): {"bind": CONTAINER_WORKDIR, "mode": "rw"}},
     )
     timed_out = False
     try:
@@ -138,11 +145,11 @@ def _run_docker(
     return {"exit_code": exit_code, "stdout": stdout, "stderr": stderr, "timed_out": timed_out}
 
 
-# ---------------- 本机直跑（轻量模式） ----------------
+# ---------------- 本机直跑（默认模式） ----------------
 
 def _host_cwd(cwd: str) -> Path:
     """把容器内路径（/workspace/...）翻译成本机工作区路径；越界一律回到工作区根。"""
-    root = settings.workspace_root.resolve()
+    root = workspace.current().resolve()
     if cwd == CONTAINER_WORKDIR:
         return root
     if cwd.startswith(CONTAINER_WORKDIR + "/"):
@@ -153,16 +160,39 @@ def _host_cwd(cwd: str) -> Path:
     return root
 
 
-def _run_host(cmd: str, *, cwd: str = CONTAINER_WORKDIR, timeout: int = 60) -> dict:
-    """本机 bash 执行。继承当前环境；把 venv/bin 放 PATH 最前，保证 python 解析到当前解释器。
+def _project_venv_bin() -> Path | None:
+    """当前项目自带的虚拟环境 bin 目录（若有）。"""
+    for name in (".venv", "venv", "env"):
+        for sub in ("bin", "Scripts"):        # Scripts 兼容 Windows
+            d = workspace.current() / name / sub
+            if d.is_dir():
+                return d
+    return None
 
-    注意：无容器隔离（网络/权限/资源全放开），安全靠 agent 层逐条人工审批。
+
+def _run_host(cmd: str, *, cwd: str = CONTAINER_WORKDIR, timeout: int = 60) -> dict:
+    """本机 bash 执行，继承当前环境。
+
+    PATH 顺序（固定"项目优先、agent 兜底"）：
+      1. 当前项目自带的 .venv/bin —— 让项目自己的 python/pytest/node 生效；
+      2. 原 PATH —— 系统工具链（node/go/cargo/…）；
+      3. agent 自己的 venv bin 兜底 —— 只在项目没提供时才解析到 agent 的解释器。
+    早期版本把 agent venv 放在最前，会劫持项目自身的 python；对任意项目（尤其
+    带自己 venv 的仓库）是错的，所以改成现在的顺序。
+
+    注意：host 模式无容器隔离（网络/权限/资源全放开），安全靠 agent 层逐条人工审批。
     """
     host_cwd = _host_cwd(cwd)
-    # 让 `python` / `pytest` 等解析到当前 venv，而不是系统 python
     env = os.environ.copy()
-    venv_bin = str(Path(sys.executable).resolve().parent)
-    env["PATH"] = venv_bin + os.pathsep + env.get("PATH", "")
+    parts: list[str] = []
+    proj_bin = _project_venv_bin()
+    if proj_bin:
+        parts.append(str(proj_bin))
+    parts.append(env.get("PATH", ""))
+    agent_bin = str(Path(sys.executable).resolve().parent)
+    if agent_bin not in parts and str(proj_bin or "") != agent_bin:
+        parts.append(agent_bin)
+    env["PATH"] = os.pathsep.join(p for p in parts if p)
     timed_out = False
     try:
         proc = subprocess.run(

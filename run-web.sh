@@ -29,5 +29,15 @@ fi
 
 PORT="${PORT:-8000}"
 echo "== 浏览器打开 http://127.0.0.1:${PORT}/ （Ctrl+C 停止）=="
-echo "== 当前工作区：$(grep -E '^WORKSPACE_ROOT=' .env 2>/dev/null | cut -d= -f2- || echo '(未设置=agent自身目录)')"
+# 当前项目由 workspace.py 的注册表决定，界面上可随时添加/切换（不再需要改 .env 重启）
+"$PY" - <<'PY' || true
+import workspace
+p = workspace.current_project()
+if p:
+    print(f"== 当前项目：{p['name']}（{p['lang']}）-> {p['path']}")
+else:
+    print("== 还没有添加项目：打开页面后点「＋ 添加工程目录」")
+print(f"== 已登记 {len(workspace.list_projects()['projects'])} 个项目，"
+      f"可在页面顶部下拉框切换 ==")
+PY
 exec "$PY" -m uvicorn webapp:app --host 127.0.0.1 --port "$PORT"

@@ -1,16 +1,23 @@
 """RAG 代码检索引擎：向量（ChromaDB）+ BM25 混合检索 + Cross-Encoder 重排。
 
 用法：
-    rag.index_codebase()            # 扫描并索引工作区代码
+    rag.index_codebase()            # 扫描并索引【当前】工作区代码
     rag.retrieve("登录校验逻辑")     # 混合检索，返回 top-k 相关代码片段
 
+任意项目相关：
+- 索引范围是 workspace.SOURCE_EXTS（多语言源码/配置/文档），不再只 rglob("*.py")；
+- 向量库按项目隔离，落在 agent 目录 <agent>/.agent_cache/projects/<项目id>/chroma，
+  不往用户仓库里写 chroma/；
+- BM25 与元数据是进程级缓存，切换项目或文件有变动时自动重建（见 _ensure_index）。
 模型懒加载：首次调用时才下载/加载 embedding 与 rerank 模型。
 """
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 
+import workspace
 from config import settings
 
 # ---- 可调参数 ----
@@ -20,11 +27,18 @@ EMBED_MODEL = "all-MiniLM-L6-v2"                       # 向量模型（小、�
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # 重排模型
 VECTOR_TOP_K = 20      # 向量检索初筛数量
 BM25_TOP_K = 20        # BM25 检索初筛数量
-CHROMA_DIR = settings.workspace_root / "chroma"
+MAX_CHUNKS = 20_000    # 单项目索引 chunk 上限（超大仓库防失控）
+REINDEX_TTL = 30.0     # 文件变动检测的最小间隔（秒），避免每次检索都全量遍历
 
 # ---- 懒加载单例 ----
 _embedder = None
 _reranker = None
+_clients: dict[str, object] = {}
+
+# 索引缓存：与"当前项目"绑定，切项目必须整体失效
+_pid: str | None = None
+_sig: tuple | None = None
+_checked_at: float = 0.0
 _bm25 = None
 _meta: list[dict] = []    # chunk 元数据 [{path, start, end}]，与语料对齐
 _corpus: list[str] = []   # chunk 文本，与 _meta 对齐
@@ -53,13 +67,26 @@ def _get_reranker():
 
 
 def _iter_code_files(root: Path):
-    """遍历代码文件，跳过 venv/缓存/向量库等。"""
-    skip = {".git", "__pycache__", ".venv", "chroma", "node_modules",
-            "bin", "lib", "include", "share", "site-packages"}
-    for p in sorted(root.rglob("*.py")):
-        if any(part in skip for part in p.parts):
+    """遍历可索引的代码文件；skip 规则统一来自 workspace.iter_files。"""
+    yield from workspace.iter_files(
+        root, exts=workspace.SOURCE_EXTS, max_bytes=workspace.MAX_TEXT_BYTES
+    )
+
+
+def _signature(root: Path) -> tuple:
+    """当前工作区的轻量指纹（文件数 + 最新 mtime），用于判断是否需要重建索引。"""
+    count = 0
+    latest = 0.0
+    for p in workspace.iter_files(root, exts=workspace.SOURCE_EXTS):
+        try:
+            st = p.stat()
+        except OSError:
             continue
-        yield p
+        if st.st_size > workspace.MAX_TEXT_BYTES:
+            continue
+        count += 1
+        latest = max(latest, st.st_mtime)
+    return (count, round(latest, 3))
 
 
 def _split(lines: list[str]):
@@ -77,17 +104,22 @@ def _split(lines: list[str]):
 
 
 def _chroma_collection():
+    """按项目取（并缓存）Chroma 集合。"""
     import chromadb
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    d = str(workspace.chroma_dir())
+    client = _clients.get(d)
+    if client is None:
+        client = chromadb.PersistentClient(path=d)
+        _clients[d] = client
     return client.get_or_create_collection("code", metadata={"hnsw:space": "cosine"})
 
 
 def index_codebase(root: Path | None = None) -> int:
-    """扫描并索引代码库，重建 Chroma 与 BM25。返回 chunk 总数。"""
-    global _bm25, _meta, _corpus
+    """扫描并索引代码库，重建当前项目的 Chroma 与 BM25。返回 chunk 总数。"""
+    global _bm25, _meta, _corpus, _pid, _sig, _checked_at
     from rank_bm25 import BM25Okapi
 
-    root = (root or settings.workspace_root).resolve()
+    root = Path(root).resolve() if root else workspace.current().resolve()
     corpus: list[str] = []
     meta: list[dict] = []
     ids: list[str] = []
@@ -102,13 +134,22 @@ def index_codebase(root: Path | None = None) -> int:
             corpus.append(text)
             meta.append({"path": rel, "start": start, "end": end})
             ids.append(f"{rel}:{start}-{end}")
+            if len(corpus) >= MAX_CHUNKS:
+                break
+        if len(corpus) >= MAX_CHUNKS:
+            break
+
+    _pid = workspace.current_id()
+    _sig = _signature(root)
+    _checked_at = time.monotonic()
 
     if not corpus:
+        _meta, _corpus, _bm25 = [], [], None
         return 0
 
     embeddings = _get_embedder().encode(corpus, normalize_embeddings=True).tolist()
 
-    # 重建向量库
+    # 重建向量库（同项目重建；不同项目各写各的目录）
     collection = _chroma_collection()
     try:
         collection.delete(where={})
@@ -123,11 +164,33 @@ def index_codebase(root: Path | None = None) -> int:
     return len(corpus)
 
 
+def reset() -> None:
+    """丢弃内存里的索引缓存（切换项目、或外部改了工作区后调用）。"""
+    global _bm25, _meta, _corpus, _pid, _sig, _checked_at
+    _bm25, _meta, _corpus, _pid, _sig, _checked_at = None, [], [], None, None, 0.0
+
+
+def _ensure_index() -> int:
+    """保证内存索引对应当前项目且不过期；需要时重建。返回 chunk 数。
+
+    这里必须检查项目 id：BM25/元数据是进程级缓存，界面切换项目后如果沿用旧缓存，
+    检索会把【上一个项目】的代码片段塞进 prompt。
+    """
+    global _sig, _checked_at
+    pid = workspace.current_id()
+    if _pid != pid:
+        return index_codebase()          # 首次使用，或界面切换到了另一个项目
+    if settings.rag_auto_reindex and time.monotonic() - _checked_at > REINDEX_TTL:
+        _checked_at = time.monotonic()          # 先置时间戳：即使下面抛错也不会每次重扫
+        if _signature(workspace.current()) != _sig:
+            return index_codebase()
+    return len(_corpus)
+
+
 def retrieve(query: str, k: int = 5) -> list[dict]:
     """混合检索 + 重排，返回 top-k 代码片段 [{path, start, end, text, score}]。"""
-    if _bm25 is None:
-        if index_codebase() == 0:
-            return []
+    if _ensure_index() == 0:
+        return []
 
     # 1) 向量检索
     qv = _get_embedder().encode([query], normalize_embeddings=True).tolist()
