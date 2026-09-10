@@ -29,7 +29,7 @@ from tools import TOOLS
 from rag import retrieve
 import workspace
 
-MAX_ITERATIONS = 5   # 防死循环：plan/execute/reflect 全局循环上限
+MAX_ITERATIONS = 5   # 全局循环上限：execute→reflect 最多跑 5 轮（由 reflect 计数、route 判定）
 MAX_TOOL_ROUNDS = 4  # 单次 execute 内最多工具往返次数
 RETRIEVE_K = 4       # 注入上下文的代码片段数
 
@@ -111,7 +111,9 @@ def plan(state: AgentState) -> dict:
         HumanMessage(f"任务：{state['task']}\n{_project_brief()}\n对话历史：\n{_history_text(state)}\n"
                      f"上一轮反馈：{state.get('feedback') or '无'}"),
     ])
-    return {"plan": msg.content, "iterations": state.get("iterations", 0) + 1}
+    # 注意：iterations 不在这里递增。route() 循环回到的是 execute，plan 只在开头跑一次，
+    # 早期把计数放在这里会让 MAX_ITERATIONS 永远不生效（死代码）——现在由 reflect 计数。
+    return {"plan": msg.content}
 
 
 def retrieve_node(state: AgentState) -> dict:
@@ -196,8 +198,12 @@ def execute(state: AgentState) -> dict:
 
 
 def reflect(state: AgentState) -> dict:
+    # 每完成一轮 execute→reflect 计一次，供 route() 判定全局迭代上限。
+    # 必须在这里（而不是 plan）递增：route() 循环回到的是 execute，plan 只在开头跑一次。
+    # 两条 return 路径都要带上这个计数，否则走短路分支时计数会停住、护栏再次失效。
+    n = state.get("iterations", 0) + 1
     if "用户已拒绝" in (state.get("result") or ""):
-        return {"done": True, "feedback": "用户拒绝了危险操作，任务终止。"}
+        return {"done": True, "feedback": "用户拒绝了危险操作，任务终止。", "iterations": n}
     llm = get_llm(settings.planner_model, thinking=False)
     decider = llm.with_structured_output(Decision, method="function_calling")
     d = decider.invoke([
@@ -207,13 +213,22 @@ def reflect(state: AgentState) -> dict:
             f"执行结果：{state['result']}"
         ),
     ])
-    return {"done": d.done, "feedback": d.feedback}
+    return {"done": d.done, "feedback": d.feedback, "iterations": n}
 
 
 def finish(state: AgentState) -> dict:
     llm = get_llm(settings.planner_model, thinking=False)
+    # 达到迭代上限而任务仍未判定完成时，明确要求如实汇报。
+    # 否则模型会"脑补成功"（README 第九节记录过同类事故：空结果被汇报成执行成功）。
+    capped = not state.get("done") and state.get("iterations", 0) >= MAX_ITERATIONS
+    sys_prompt = "用中文简洁汇报任务完成情况。"
+    if capped:
+        sys_prompt += (
+            f"注意：已用满 {MAX_ITERATIONS} 轮迭代仍未判定任务完成，"
+            "必须如实说明已完成到哪一步、还有什么没做完，不得声称任务已完成。"
+        )
     summary = llm.invoke([
-        SystemMessage("用中文简洁汇报任务完成情况。"),
+        SystemMessage(sys_prompt),
         HumanMessage(f"任务：{state['task']}\n对话历史：\n{_history_text(state)}\n执行结果：{state['result']}"),
     ])
     # 把最终答复写回 messages，随 checkpoint 持久化，供下一轮对话回放
