@@ -9,11 +9,15 @@
   - 危险操作（rm -rf / git push / sudo / 联网命令等）触发 interrupt() 人工审批
 - reflect：Pro 模型结构化输出（thinking 关），判断是否完成
 - finish：Pro 模型总结汇报
-- 记忆（两层，均存放在 agent 自己目录、按项目隔离，不污染用户仓库）：
-  - 会话历史：State.messages（add_messages reducer）随 checkpoint 持久化，跨运行回放对话
-  - 长期偏好：remember_fact / recall_memory 工具落盘 projects/<项目id>/memory.md，跨会话可查
+- 记忆（两层，都不写进被操作的用户仓库）：
+  - 会话历史：State.messages（add_messages reducer）随 Checkpointer 按 thread_id 持久化
+  - 长期偏好：remember_fact / recall_memory 走 LangGraph Store（见 memory.py），
+    以 namespace ("memory", 项目id) 隔离，跨会话、跨线程可查
+- 横切能力（重试 / 摘要 / 权限控制 / 人工审批）自实现于 middleware.py，本文件只做编排：
+  - 重试：所有模型调用走 middleware.call_model（指数退避 + 抖动）
+  - 摘要：plan 里先 compact_history 折叠长会话，prompt 统一用 middleware.history_text
+  - 权限 + 审批：execute 里每次工具调用先过 middleware.review_tool_call
 """
-import re
 import sqlite3
 from typing import Annotated
 from typing_extensions import TypedDict
@@ -21,27 +25,20 @@ from langchain_core.messages import AIMessage, SystemMessage, HumanMessage, Tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from config import settings, get_llm
+from middleware import call_model, compact_history, history_text, review_tool_call
 from tools import TOOLS
 from rag import retrieve
+import memory
 import workspace
 
 MAX_ITERATIONS = 5   # 全局循环上限：execute→reflect 最多跑 5 轮（由 reflect 计数、route 判定）
 MAX_TOOL_ROUNDS = 4  # 单次 execute 内最多工具往返次数
 RETRIEVE_K = 4       # 注入上下文的代码片段数
 
-# 危险命令模式：(正则, 风险说明)
-DANGEROUS_PATTERNS = [
-    (r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)", "递归删除文件"),
-    (r"\bgit\s+push\b", "git 推送到远程"),
-    (r"\bgit\s+reset\s+--hard\b", "git 硬重置（丢失提交）"),
-    (r"\bsudo\b", "提权执行"),
-    (r"\bchmod\s+777\b", "开放所有权限"),
-    (r"\bshutdown\b|\breboot\b", "关机/重启"),
-]
+# 危险命令模式与审批判定见 middleware.py（permission_risk / approval_reason / review_tool_call）
 
 
 class AgentState(TypedDict):
@@ -52,26 +49,14 @@ class AgentState(TypedDict):
     feedback: str
     done: bool
     iterations: int
+    history_summary: str      # 摘要中间件折叠出的"更早对话摘要"
+    history_summarized: int   # 已折叠到第几条，避免重复摘要同一批消息
     messages: Annotated[list, add_messages]  # 会话历史，随 checkpoint 持久化、跨运行回放
 
 
 class Decision(BaseModel):
     done: bool = Field(description="任务是否已完成")
     feedback: str = Field(description="未完成时给出下一步具体反馈；完成时可留空")
-
-
-def _history_text(state: AgentState) -> str:
-    """把持久化的会话消息（用户/助手轮次）压缩成文本注入 prompt，实现跨会话记忆。"""
-    msgs = state.get("messages") or []
-    if not msgs:
-        return "（无历史）"
-    lines = []
-    for m in msgs:
-        role = "用户" if isinstance(m, HumanMessage) else "助手"
-        content = getattr(m, "content", "")
-        if isinstance(content, str) and content.strip():
-            lines.append(f"{role}：{content.strip()}")
-    return "\n".join(lines[-16:]) or "（无历史）"
 
 
 def _project_brief() -> str:
@@ -87,33 +72,25 @@ def _project_brief() -> str:
         return f"当前项目：{workspace.current()}（识别失败：{e}）"
 
 
-def _danger_check(tc: dict) -> str | None:
-    """判断一次工具调用是否危险，返回风险说明；不危险返回 None。"""
-    if tc.get("name") != "run_shell":
-        return None
-    args = tc.get("args") or {}
-    cmd = args.get("command", "")
-    if args.get("allow_network"):
-        return "命令需要网络访问（可能下载代码或推送变更）"
-    for pat, why in DANGEROUS_PATTERNS:
-        if re.search(pat, cmd):
-            return why
-    return None
-
-
 def plan(state: AgentState) -> dict:
+    # 摘要中间件：长会话先折叠成摘要（消息不够多时不触发，也不会产生额外模型调用）
+    folded = compact_history(state, get_llm(settings.executor_model, thinking=False))
+    view = {**state, **folded} if folded else state
     llm = get_llm(settings.planner_model, thinking=True)
-    msg = llm.invoke([
+    msg = call_model(llm, [
         SystemMessage("你是资深代码助手。针对任务给出简洁、可执行的步骤计划，直接列步骤。"
                       "项目可能是任意语言/技术栈，不要假设是 Python；不确定项目结构时，"
                       "计划里应先安排用工具了解项目（describe_project / list_files）。"
                       "若任务涉及用户偏好或历史事实，先结合对话历史/记忆作答。"),
-        HumanMessage(f"任务：{state['task']}\n{_project_brief()}\n对话历史：\n{_history_text(state)}\n"
+        HumanMessage(f"任务：{state['task']}\n{_project_brief()}\n对话历史：\n{history_text(view)}\n"
                      f"上一轮反馈：{state.get('feedback') or '无'}"),
-    ])
+    ], label="plan")
     # 注意：iterations 不在这里递增。route() 循环回到的是 execute，plan 只在开头跑一次，
     # 早期把计数放在这里会让 MAX_ITERATIONS 永远不生效（死代码）——现在由 reflect 计数。
-    return {"plan": msg.content}
+    out = {"plan": msg.content}
+    if folded:
+        out.update(folded)
+    return out
 
 
 def retrieve_node(state: AgentState) -> dict:
@@ -148,46 +125,30 @@ def execute(state: AgentState) -> dict:
         ),
         HumanMessage(
             f"任务：{state['task']}\n{_project_brief()}\n计划：{state['plan']}\n"
-            f"对话历史：\n{_history_text(state)}\n"
+            f"对话历史：\n{history_text(state)}\n"
             f"反馈：{state.get('feedback') or '无'}\n相关代码上下文：\n{ctx}"
         ),
     ]
     result = ""
     for _ in range(MAX_TOOL_ROUNDS):
-        ai = llm.invoke(msgs)
+        ai = call_model(llm, msgs, label="execute")
         msgs.append(ai)
         if not ai.tool_calls:
             result = ai.content or ""
             break
         for tc in ai.tool_calls:
+            # 人工审批中间件：危险操作一律审批；host 模式（无沙箱）下命令逐条审批。
+            # 拒绝后的两种处置（终止任务 / 反馈给模型换做法）由中间件判定，这里只执行结论。
+            review = review_tool_call(tc)
+            if review.action == "abort":
+                return {"result": review.message}
+            if review.action == "feedback":
+                msgs.append(ToolMessage(content=review.message, tool_call_id=tc["id"]))
+                continue
             fn = next((t for t in TOOLS if t.name == tc["name"]), None)
             if fn is None:
                 obs = f"未知工具: {tc['name']}"
             else:
-                # 人工审批：
-                #   - 危险操作（rm -rf / git push / sudo …）一律审批；
-                #   - host 模式（无 Docker 沙箱）下，任何 run_shell / run_test 命令都逐条审批。
-                reason = _danger_check(tc)
-                if reason is None and tc["name"] in ("run_shell", "run_test") \
-                        and settings.exec_mode == "host":
-                    reason = "轻量模式（无 Docker 沙箱）：命令在本机直接执行"
-                if reason:
-                    decision = interrupt({
-                        "question": f"是否允许执行以下操作？\n工具：{tc['name']}\n参数：{tc['args']}\n原因：{reason}",
-                        "tool": tc["name"],
-                        "args": tc["args"],
-                        "reason": reason,
-                    })
-                    if not (decision or {}).get("approved"):
-                        if _danger_check(tc):
-                            # 危险操作被拒 → 终止任务（保持原有安全语义）
-                            return {"result": f"用户已拒绝执行该危险操作（{reason}），任务已终止。"}
-                        # host 模式普通命令被拒 → 不终止任务：把反馈喂回模型，让它换一种方式
-                        msgs.append(ToolMessage(
-                            content=f"用户拒绝了这条命令（{reason}）。"
-                                    f"请改用不执行该命令的方式完成任务，或先向用户说明必要性。",
-                            tool_call_id=tc["id"]))
-                        continue
                 try:
                     obs = fn.invoke(tc["args"])
                 except Exception as e:  # noqa: BLE001 —— 工具异常回传给模型重试
@@ -206,13 +167,13 @@ def reflect(state: AgentState) -> dict:
         return {"done": True, "feedback": "用户拒绝了危险操作，任务终止。", "iterations": n}
     llm = get_llm(settings.planner_model, thinking=False)
     decider = llm.with_structured_output(Decision, method="function_calling")
-    d = decider.invoke([
+    d = call_model(decider, [
         SystemMessage("评估执行结果是否已达成任务目标，未达成时给出针对性反馈。"),
         HumanMessage(
-            f"任务：{state['task']}\n计划：{state['plan']}\n对话历史：\n{_history_text(state)}\n"
+            f"任务：{state['task']}\n计划：{state['plan']}\n对话历史：\n{history_text(state)}\n"
             f"执行结果：{state['result']}"
         ),
-    ])
+    ], label="reflect")
     return {"done": d.done, "feedback": d.feedback, "iterations": n}
 
 
@@ -227,10 +188,10 @@ def finish(state: AgentState) -> dict:
             f"注意：已用满 {MAX_ITERATIONS} 轮迭代仍未判定任务完成，"
             "必须如实说明已完成到哪一步、还有什么没做完，不得声称任务已完成。"
         )
-    summary = llm.invoke([
+    summary = call_model(llm, [
         SystemMessage(sys_prompt),
-        HumanMessage(f"任务：{state['task']}\n对话历史：\n{_history_text(state)}\n执行结果：{state['result']}"),
-    ])
+        HumanMessage(f"任务：{state['task']}\n对话历史：\n{history_text(state)}\n执行结果：{state['result']}"),
+    ], label="finish")
     # 把最终答复写回 messages，随 checkpoint 持久化，供下一轮对话回放
     return {"result": summary.content, "messages": [AIMessage(content=summary.content)]}
 
@@ -254,12 +215,16 @@ graph.add_edge("execute", "reflect")
 graph.add_conditional_edges("reflect", route, {"execute": "execute", "finish": "finish"})
 graph.add_edge("finish", END)
 
-# 会话记忆：checkpoint 持久化到【agent 自己目录】的 sqlite（不再写进被操作的用户仓库），
-# 一个 sqlite 承载所有项目，靠 thread_id 的项目前缀隔离（见 workspace.thread_key）。
-# 长期偏好：由 remember_fact / recall_memory 工具落盘到按项目隔离的 memory.md（见 tools.py）
+# 两层记忆各用各的机制：
+# - Checkpointer：会话历史（State.messages）按 thread_id 持久化，解决"同一会话跨运行"。
+#   落盘在【agent 自己目录】的 sqlite，一个 sqlite 承载所有项目，靠 thread_id 项目前缀隔离
+#   （见 workspace.thread_key）。
+# - Store：跨会话/跨线程的长期信息（用户偏好、项目约定），由 remember_fact / recall_memory
+#   读写，解决"跨线程信息"。落盘在 .agent_cache/store.sqlite，靠 namespace
+#   ("memory", 项目id) 隔离（见 memory.py）。工具内用 get_store() 取到的就是这里传进去的实例。
 CHECKPOINT_DB = workspace.CHECKPOINT_DB
 CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
 _conn = sqlite3.connect(str(CHECKPOINT_DB), check_same_thread=False)
 checkpointer = SqliteSaver(_conn)
 
-app = graph.compile(checkpointer=checkpointer)
+app = graph.compile(checkpointer=checkpointer, store=memory.store)

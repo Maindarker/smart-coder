@@ -107,6 +107,7 @@ def _run(
     state = {
         "task": task, "plan": "", "context": "", "result": "",
         "feedback": "", "done": False, "iterations": 0,
+        "history_summary": "", "history_summarized": 0,
         "messages": [HumanMessage(content=task)],
     }
 

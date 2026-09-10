@@ -9,6 +9,7 @@
 """
 import sys
 
+import memory
 import workspace
 from agent import app
 from langchain_core.messages import HumanMessage
@@ -23,6 +24,9 @@ def _ask_approval(question: str) -> bool:
 
 def main() -> None:
     for note in workspace.migrate_legacy_state():
+        print(f"[migrate] {note}")
+    # 长期记忆从 memory.md 迁到 LangGraph Store（幂等，仅首次有输出）
+    for note in memory.migrate_from_memory_md():
         print(f"[migrate] {note}")
 
     args = sys.argv[1:]
@@ -48,6 +52,7 @@ def main() -> None:
     # 只重置本轮工作态；messages 走 add_messages reducer 会追加到历史，不会被清空
     state = {"task": task, "plan": "", "context": "", "result": "",
              "feedback": "", "done": False, "iterations": 0,
+             "history_summary": "", "history_summarized": 0,
              "messages": [HumanMessage(content=task)]}
 
     print(f"\n任务：{task}\n项目：{workspace.current()}\n会话：{thread_id}\n" + "=" * 60)

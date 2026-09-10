@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 import engine
 import dirpicker
+import memory
 import workspace
 from config import settings
 from sandbox import effective_mode
@@ -35,6 +36,10 @@ app = FastAPI(title="smart-coder", version="0.2.0")
 
 # 一次性把单项目时代的会话库/记忆认领到新的按项目结构下（幂等；升级首启动时才有输出）
 for _note in workspace.migrate_legacy_state():
+    print(f"[migrate] {_note}")
+
+# 长期记忆从 memory.md 迁到 LangGraph Store（幂等；仅在 Store 里还没有该项目记忆时导入）
+for _note in memory.migrate_from_memory_md():
     print(f"[migrate] {_note}")
 
 WEB_DIR = Path(__file__).resolve().parent / "web"

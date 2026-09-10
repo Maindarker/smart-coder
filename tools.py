@@ -10,13 +10,14 @@
 - 文件读写：list_files / read_file 仅限当前工作区内，路径越界拒绝
 - 命令执行：run_shell / run_test 走 sandbox.run_command —— docker 模式在非 root
   容器内跑（默认断网、限时限内存），host 模式在本机直跑但每条命令都经人工审批
-- 长期记忆：remember_fact / recall_memory 落盘到 agent 目录下按项目隔离的 memory.md
+- 长期记忆：remember_fact / recall_memory 走 LangGraph Store（见 memory.py），
+  按项目 namespace 隔离，跨会话、跨线程可查
 """
-import datetime
 from pathlib import Path
 
 from langchain_core.tools import tool
 
+import memory
 import workspace
 from sandbox import CONTAINER_WORKDIR, effective_mode, run_command
 
@@ -214,25 +215,16 @@ def _top_entries(d: Path, limit: int = 30) -> list[str]:
 def remember_fact(fact: str) -> str:
     """把一条需要长期记住的事实/偏好写入当前项目的记忆库（如用户偏好、项目约定、决定）。
 
-    之后无论哪个会话，只要还在这个项目里，就可用 recall_memory 查回这条事实。
+    之后无论哪个会话、哪个线程，只要还在这个项目里，就可用 recall_memory 查回这条事实。
     """
-    p = workspace.memory_file()
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with p.open("a", encoding="utf-8") as f:
-        f.write(f"- [{ts}] {fact.strip()}\n")
-    return f"已记住（项目 {workspace.current_id()}）：{fact.strip()}"
+    entry = memory.remember(fact)
+    return f"已记住（项目 {workspace.current_id()}）：{entry['fact']}"
 
 
 @tool
 def recall_memory(query: str = "") -> str:
     """读取当前项目记忆库中的事实/偏好。query 为关键词（留空返回全部）。"""
-    p = workspace.memory_file()
-    if not p.exists():
-        return "（记忆库为空）"
-    lines = p.read_text(encoding="utf-8").strip().splitlines()
-    if query:
-        lines = [l for l in lines if query.lower() in l.lower()]
-    return "\n".join(lines) if lines else "（没有匹配的记忆）"
+    return memory.recall_text(query)
 
 
 TOOLS = [list_files, read_file, search_code, describe_project,
