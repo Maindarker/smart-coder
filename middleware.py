@@ -348,7 +348,8 @@ def review_tool_call(tc: dict, *, context: str = "") -> Review:
         return Review("allow", escalation=level)
     if hard:
         # 围栏兜不住的操作被拒 → 终止任务，不留给模型"换个写法绕过"的机会。
-        # 这句文案被 reflect 的短路判断和 finish 依赖，改动需同步（grep "用户已拒绝"）。
+        # 拒绝即终止的文案。注意：reflect 的短路判据是 state.aborted（结构化字段），
+        # **不再**依赖这句话的字面 —— 这句话现在只用于汇报，改文案不会再让短路静默失效。
         return Review("abort", f"用户已拒绝执行该操作（{reason}），任务已终止。")
     return Review(
         "feedback",

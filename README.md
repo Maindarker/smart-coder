@@ -1152,12 +1152,36 @@ command_verdict("sudo ls").level                    # 'uncontained'（needs='ful
 **修复**：
 
 1. 拒绝后**直接 `return`**，把"用户已拒绝"作为明确结果返回，不再给模型编造的机会
-2. reflect 节点识别 `"用户已拒绝"` 字样就直接 `done=True`，不再让 Pro 评估"是否完成"（避免误判未完成而空转循环）
+2. reflect 节点识别到"任务已终止"就直接 `done=True`，不再让 Pro 评估"是否完成"（避免误判未完成而空转循环）。
+   判据是 gate 写下的结构化字段 `state.aborted`；**不是**去 `result` 里匹配"用户已拒绝"字样 ——
+   后者既会因文案改动静默失效（旧代码里三处注释在警告这件事），也可能被工具读到的文件内容
+   （不可信输入）伪造出来：一份写着"用户已拒绝"的文件就能让任务被判成"已终止"而直接收尾。
 
 本次改造后这条路径仍然成立：只有"围栏兜不住的操作"被拒才会走到它（拒绝围栏内的破坏走的是
 "把原因反馈给模型、继续任务"）。
 
-### 9.6 这套模型的已知局限
+### 9.6 🕳️ 坑：跨轮"失忆"与验收信息残缺
+
+**现象**：任务跑两轮以上时，第二轮执行器不知道上一轮看过什么文件、命令输出是什么 —— 只看得到
+reflect 写的一句 `feedback`，于是重复读文件、或基于过期信息决策；同时验收员（reflect）是在
+"最后一句工具输出"上拍板"做完了没有"的。
+
+**根因**（三个叠加）：
+
+1. `exec_msgs`（本轮的 AI / Tool 消息）定位是"单次 execute 的局部变量"，reflect 收尾时被清空，
+   而它是唯一装着工具结果原文的地方；
+2. `_exec_prompt` 没注入 `result`，`history_text` 又只读 `state.messages`，而 `ToolMessage`
+   从没进过 `messages` —— 于是跨轮只剩下 reflect 的一句话；
+3. `reflect` 只拿到一条 `result`（`execute_tools` 里 `result = str(obs)` 是**覆盖**不是追加），
+   看不到本轮经过，也看不到 git 采集的"实际改了什么"。
+
+**修复**：新增跨轮通道 `exec_digest`（`agent._exec_digest` / `_merge_digest`）—— reflect 每轮把
+本轮经过（谁调了什么工具、拿到什么结果、模型说了什么）压成摘要累积写回，execute / reflect / finish
+三处 prompt 都注入；`reflect` 的判据补成"逐条对照计划 + 只认机器可见证据"。同时修掉两处污染
+`result` 的边角：**空 `content` 不再覆盖 `result`**（这正是 9.5 那起事故的入口），**全被拒的一轮也会
+刷新 `result`**（否则 reflect 拿着上一轮的旧观测判断完成度）。回归见 `tests/test_exec_memory.py`。
+
+### 9.7 这套模型的已知局限
 
 - **解释器 + 代码字符串**（`python -c`、`node -e`）能绕过文本判定 —— 但绕不过围栏（它照样只能写项目内、照样没网）；
 - **macOS 的围栏依赖已被 Apple 标记 deprecated 的 `sandbox-exec`**：目前每个 macOS 都还带，

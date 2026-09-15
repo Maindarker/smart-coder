@@ -119,8 +119,9 @@ def _run(
         "feedback": "", "done": False, "iterations": 0,
         "history_summary": "", "history_summarized": 0,
         # 执行器工作通道（覆盖式通道，每次跑任务都重置，避免跨任务累积）
+        # exec_digest 是其中唯一"跨轮累积"的：由 reflect 每轮写回，见 agent._exec_digest()
         "exec_msgs": [], "pending_calls": [], "decisions": {},
-        "tool_rounds": 0, "aborted": False,
+        "tool_rounds": 0, "aborted": False, "exec_digest": "",
         "snapshot_path": str(snap.path) if snap.available else "",
         "messages": [HumanMessage(content=task)],
     }

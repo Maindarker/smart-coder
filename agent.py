@@ -14,6 +14,10 @@
   有副作用工具被重复执行。把 `interrupt()` 单独放进无副作用的 gate，重放就完全幂等了。
 - reflect：Pro 模型结构化输出（thinking 关），判断是否完成
 - finish：Pro 模型总结汇报
+- 跨轮经过（`exec_digest`）：`exec_msgs` 是"单次 execute 的局部变量"，reflect 收尾时会把它清空，
+  于是下一轮 execute 只看得到 reflect 的一句 feedback —— 前面几次工具调用**拿到了什么原文**全丢。
+  现在 reflect 把本轮经过压成摘要累积进 `exec_digest`，execute / reflect / finish 三处 prompt
+  都能看到（见 `_exec_digest()`）；它也是 reflect 判"做完了没有"时的事实依据。
 - 记忆（两层，都不写进被操作的用户仓库）：
   - 会话历史：State.messages（add_messages reducer）随 Checkpointer 按 thread_id 持久化
   - 长期偏好：remember_fact / recall_memory 走 LangGraph Store（见 memory.py），
@@ -46,6 +50,10 @@ MAX_ITERATIONS = 5   # 全局循环上限：execute→reflect 最多跑 5 轮（
 MAX_TOOL_ROUNDS = 4  # 单次 execute 内最多工具往返次数（现由 state.tool_rounds 计数）
 RETRIEVE_K = 4       # 注入上下文的代码片段数
 
+# 跨轮经过摘要（exec_digest）的体积控制：每条消息留多少、累积到多少就丢最老的
+DIGEST_MSG_CHARS = 320    # 单条 AI / Tool 消息在摘要里保留的字符数
+DIGEST_MAX_CHARS = 3000   # 累积上限；超了就只留尾部（最近几轮才是下一轮真正要用的）
+
 # 危险命令判定与审批判定见 shellrisk.py / middleware.py（command_risk / permission_risk / review_tool_call）
 # 执行环境/围栏见 confinement.py + sandbox.py，可逆性快照见 snapshot.py
 
@@ -68,6 +76,9 @@ class AgentState(TypedDict):
     decisions: dict      # tool_call_id → {"action": "allow|feedback|abort|skip", "message", "escalation"}
     tool_rounds: int     # 本轮 execute 内已完成的工具往返次数（走图循环计数，替代原 for 循环）
     aborted: bool        # 本轮是否因用户拒绝危险操作而终止（任务级结论：下一轮 execute 开始时才复位）
+    # 上面几个通道 reflect 收尾时一律清空；**只有它不清**（由 reflect 累积写回）——
+    # 它是"上几轮到底看过什么、改过什么"的唯一跨轮载体，见 _exec_digest()。
+    exec_digest: str
     # ---- 任务级（由 engine.py / main.py 在任务开始时写入）----
     snapshot_path: str   # 任务开始时的可逆性快照目录（snapshot.py）；空 = 没有快照可回滚
     changes: str         # 本次任务**实际**改了什么（git 机器采集，每轮工具执行后刷新）
@@ -169,9 +180,54 @@ def _exec_prompt(state: AgentState) -> list:
         HumanMessage(
             f"任务：{state['task']}\n{_project_brief()}\n计划：{state['plan']}\n"
             f"对话历史：\n{history_text(state)}\n"
-            f"反馈：{state.get('feedback') or '无'}\n相关代码上下文：\n{ctx}"
+            f"反馈：{state.get('feedback') or '无'}\n"
+            f"前几轮的经过（跨轮保留；本轮的工具结果会以对话形式继续追加在后面）：\n"
+            f"{state.get('exec_digest') or '（无，这是第一轮）'}\n"
+            f"相关代码上下文：\n{ctx}"
         ),
     ]
+
+
+def _exec_digest(msgs, round_no: int) -> str:
+    """把一轮 execute 的 exec_msgs 压成"可跨轮传递的经过摘要"。
+
+    为什么需要它：`exec_msgs` 的定位是"单次 execute 的局部变量"，reflect 收尾时会被清空。
+    于是下一轮 execute 的 prompt 里只剩 reflect 的一句 feedback —— 前面几次工具调用**到底
+    拿到了什么原文**（文件内容、命令输出、报错）全部丢失，执行器只能猜或者重做一遍。
+    这个摘要就是补上那条通道，同时它也是 reflect 判"做完了没有"的证据来源。
+
+    两处取舍：
+    - 用 `trace.brief` / `trace.args_brief` 压成一行：既控制体积，也顺手挡住"工具输出里
+      自带换行伪造出一段摘要结构"这种注入（工具输出是不可信输入）。
+    - 只保留经过，不保留原始消息对象：目标是让模型**知道前面发生了什么**，
+      不是把整份文件内容再喂一遍（那会挤爆上下文）。
+    """
+    lines: list[str] = []
+    for m in msgs:
+        if isinstance(m, AIMessage):
+            calls = getattr(m, "tool_calls", None) or []
+            if calls:
+                lines.append("· 想调用：" + "；".join(
+                    f"{c.get('name')}({trace.args_brief(c.get('args'))})" for c in calls))
+            content = m.content if isinstance(m.content, str) else ""
+            if content.strip():
+                lines.append("· 模型说：" + trace.brief(content, DIGEST_MSG_CHARS))
+        elif isinstance(m, ToolMessage):
+            lines.append("· 结果：" + trace.brief(m.content, DIGEST_MSG_CHARS))
+    if not lines:
+        return ""
+    return f"【第 {round_no} 轮 execute】\n" + "\n".join(lines)
+
+
+def _merge_digest(prev: str, new: str) -> str:
+    """累积经过摘要；超过上限时只留尾部（最近几轮的经过才是下一轮真正要用的）。"""
+    parts = [p.strip() for p in (prev, new) if p and p.strip()]
+    if not parts:
+        return ""
+    merged = "\n\n".join(parts)
+    if len(merged) <= DIGEST_MAX_CHARS:
+        return merged
+    return "…（更早几轮的经过已省略）\n" + merged[-DIGEST_MAX_CHARS:]
 
 
 @trace.node("execute_model")
@@ -197,7 +253,11 @@ def execute_model(state: AgentState) -> dict:
         "aborted": False,
     }
     if not ai.tool_calls:            # 模型给的是最终总结，本轮结束
-        out["result"] = ai.content or ""
+        # 只有**真拿到内容**才覆盖 result。以前是无条件 `ai.content or ""`，于是模型"不发工具
+        # 调用且 content 为空"时会把 result 抹成空串，reflect 随即看到一句空的"执行结果"——
+        # 这正是 README 第九节那起"空结果被汇报成执行成功"事故的入口。
+        text = ai.content if isinstance(ai.content, str) else ""
+        out["result"] = text or (state.get("result") or "")
     return out
 
 
@@ -271,6 +331,7 @@ def execute_tools(state: AgentState) -> dict:
     exec_msgs = list(state.get("exec_msgs") or [])
     result = ""
     aborted_msg = ""
+    rejected: list[str] = []
     executed = False
     for tc in state.get("pending_calls") or []:
         d = decisions.get(tc["id"]) or {"action": "allow"}
@@ -282,8 +343,9 @@ def execute_tools(state: AgentState) -> dict:
             continue
         if action == "feedback":
             # 拒绝普通命令/越界请求：不执行，但把原因喂回模型，让它换一种做法（既有语义不变）
-            exec_msgs.append(ToolMessage(content=d.get("message") or "",
-                                         tool_call_id=tc["id"]))
+            msg = d.get("message") or ""
+            rejected.append(msg)
+            exec_msgs.append(ToolMessage(content=msg, tool_call_id=tc["id"]))
             continue
         fn = next((t for t in TOOLS if t.name == tc["name"]), None)
         escalation = d.get("escalation") or ""
@@ -315,11 +377,48 @@ def execute_tools(state: AgentState) -> dict:
         except Exception as e:  # noqa: BLE001 —— 采集失败不该影响任务
             out["changes"] = f"（改动采集失败：{e}）"
     if aborted_msg:
-        # 这句文案被 reflect 的短路判断依赖（grep "用户已拒绝"），改动需同步
+        # 终止文案：reflect 的短路判据是 state.aborted（结构化字段），不再依赖这句话的字面
         out["result"] = aborted_msg
     elif result:
         out["result"] = result
+    elif rejected:
+        # 本轮一个工具都没真的执行（全被拒、只回了反馈）：result 也必须刷新成"这轮的事实"，
+        # 否则 out 里不带 result，state 会保留**上一轮**的旧观测 —— reflect 就拿着过期信息判完成度。
+        out["result"] = "\n".join(m for m in rejected if m) or "本轮所有工具调用都被用户拒绝，未执行任何操作。"
     return out
+
+
+#: 验收员的判据。以前这里只有一句"评估执行结果是否已达成任务目标"，于是验收完全靠印象：
+#: result 常常只是一条原始工具输出（不是结论），却照样被拍板。现在要求它**逐条对照计划**、
+#: 并且只在有机器可见证据时才判完成 —— 这是治"旧测试跑通 2 passed 就误判任务完成"的关键。
+REFLECT_SYSTEM_PROMPT = (
+    "你是任务验收员：判断执行器这一轮是否**真的**达成了任务目标。"
+    "逐条核对下面的判据，任何一条不满足就判未完成：\n"
+    "1) 对照计划：计划里的每一步，是否都有对应的工具动作、或在结果里有明确交代？\n"
+    "2) 要证据、不要表态：只有机器可见的证据（工具返回的成功输出、测试通过、git 改动清单）"
+    "才算完成；模型自己在文字里说\"已完成\"不算证据。\n"
+    "3) 覆盖任务要求的**每一项**（含新增测试、文档、边界情况）；漏一项就是未完成。\n"
+    "4) 出现工具报错 / 输出为空 / 声称改了代码但改动清单为空 时，一律判未完成。\n"
+    "5) 只是『读了文件、了解了项目』而没有产生任务要求的实际改动时，判未完成。\n"
+    "未完成时给出**可直接执行**的下一步反馈（还差什么、建议用哪个工具），不要只说\"继续\"。"
+)
+
+
+def _reflect_prompt(state: AgentState, digest: str) -> str:
+    """验收员看到的事实：任务 + 计划 + 本轮的**完整经过** + 机器采集的改动。
+
+    以前只给一条 `result`（最后一次工具输出或模型的一句总结），验收员是在信息残缺的情况下
+    拍板的：看不到前面几次工具调用干了什么，也看不到 git 说的"实际改了什么"。
+    """
+    text = (f"任务：{state['task']}\n计划：{state['plan']}\n"
+            f"对话历史：\n{history_text(state)}\n"
+            f"本轮执行经过：\n{digest or '（本轮没有任何工具动作）'}\n"
+            f"执行器最后的输出：{state.get('result') or '（无）'}")
+    changes = (state.get("changes") or "").strip()
+    if changes:
+        text += ("\n本次实际改动（git 机器采集，以此为准；为空即说明没改动任何文件）：\n"
+                 + changes)
+    return text
 
 
 @trace.node("reflect")
@@ -332,18 +431,23 @@ def reflect(state: AgentState) -> dict:
     # 保证下一轮 execute 从干净状态开始，也避免上一轮的工具调用被重复回放给模型。
     # 注意**不含 aborted**：那是任务级结论（被拒绝而终止），留在 state 里供程序消费，
     # 由下一轮 execute_model 开头复位。
-    reset = {"exec_msgs": [], "pending_calls": [], "decisions": {}, "tool_rounds": 0}
-    if "用户已拒绝" in (state.get("result") or ""):
+    # 也**不含 exec_digest**：它是唯一跨轮的通道 —— 清空前先把本轮经过压进去累积。
+    digest = _exec_digest(state.get("exec_msgs") or [], n)
+    reset = {"exec_msgs": [], "pending_calls": [], "decisions": {}, "tool_rounds": 0,
+             "exec_digest": _merge_digest(state.get("exec_digest") or "", digest)}
+    # 用户拒绝"围栏兜不住"的操作 → 任务终止。判据用 gate 写下的结构化字段 state.aborted，
+    # **不再**去 result 里匹配"用户已拒绝"这几个字。字符串匹配有两个问题：
+    #   1) 跨文件靠一句中文文案耦合，改一个字就静默失效（旧代码里三处注释在警告这件事）；
+    #   2) result 里可能装着**工具读到的文件内容**（不可信输入）—— 一份内容里恰好写了
+    #      "用户已拒绝"的文件，就能让任务被误判成"已终止"而直接收尾。
+    if state.get("aborted"):
         return {"done": True, "feedback": "用户拒绝了危险操作，任务终止。",
                 "iterations": n, **reset}
     llm = get_llm(settings.planner_model, thinking=False)
     decider = llm.with_structured_output(Decision, method="function_calling")
     d = call_model(decider, [
-        SystemMessage("评估执行结果是否已达成任务目标，未达成时给出针对性反馈。"),
-        HumanMessage(
-            f"任务：{state['task']}\n计划：{state['plan']}\n对话历史：\n{history_text(state)}\n"
-            f"执行结果：{state['result']}"
-        ),
+        SystemMessage(REFLECT_SYSTEM_PROMPT),
+        HumanMessage(_reflect_prompt(state, digest)),
     ], label="reflect", model=settings.planner_model)
     return {"done": d.done, "feedback": d.feedback, "iterations": n, **reset}
 
@@ -365,6 +469,11 @@ def finish(state: AgentState) -> dict:
         sys_prompt += ("汇报里必须包含『本次实际改动』一节，且**只能依据下面由 git 采集的事实**，"
                        "不得夸大、不得编造未发生的改动；没有改动就直说没有。")
     human = f"任务：{state['task']}\n对话历史：\n{history_text(state)}\n执行结果：{state['result']}"
+    digest = (state.get("exec_digest") or "").strip()
+    if digest:
+        # 汇报"做到哪一步"要有依据：result 只是最后一句，实际过程在这里。
+        # 尤其是 capped（用满 5 轮仍未完成）时，"还有什么没做完"只能从这里读出来。
+        human += f"\n本次执行经过（供你如实说明做到哪一步）：\n{digest}"
     if changes:
         human += f"\n本次实际改动（git 机器采集，以此为准）：\n{changes}"
     summary = call_model(llm, [SystemMessage(sys_prompt), HumanMessage(human)], label="finish",
