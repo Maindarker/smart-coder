@@ -18,6 +18,7 @@ CLI / Web / 桌面都只调 run_task()，区别只在 approve 与 on_event 两�
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,9 +27,13 @@ from typing import Callable, Optional
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
+import sandbox
+import trace
 import workspace
 from agent import app
+from config import settings
 from cost import tracker
+import snapshot
 
 #: 审批等待上限（秒），超时视为拒绝（浏览器关掉后引擎线程不至于永久阻塞）
 DEFAULT_APPROVAL_TIMEOUT = 600.0
@@ -45,6 +50,7 @@ class ApprovalRequest:
     tool: str
     args: dict
     reason: str
+    escalation: str = ""        # "" | "network" | "full"：批准后本次调用放宽到哪一档
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     _done: threading.Event = field(default_factory=threading.Event, repr=False)
     _approved: bool = False
@@ -71,6 +77,7 @@ def _find_pending(config: dict) -> Optional[ApprovalRequest]:
                 tool=v.get("tool", ""),
                 args=v.get("args", {}),
                 reason=v.get("reason", ""),
+                escalation=v.get("escalation", ""),
             )
     return None
 
@@ -104,10 +111,17 @@ def _run(
 ) -> dict:
     # 会话历史按项目隔离：同一 thread_id 在不同项目里是两段互不可见的对话
     config = {"configurable": {"thread_id": workspace.thread_key(thread_id)}}
+    # 任务级可逆性快照：命令在围栏内可以放手跑（连 rm -rf 都不必逐条审批），
+    # 前提是"出事了能回到任务开始前" —— 这个前提就是这一步建立的（见 snapshot.py）。
+    snap = snapshot.begin(label=task)
     state = {
         "task": task, "plan": "", "context": "", "result": "",
         "feedback": "", "done": False, "iterations": 0,
         "history_summary": "", "history_summarized": 0,
+        # 执行器工作通道（覆盖式通道，每次跑任务都重置，避免跨任务累积）
+        "exec_msgs": [], "pending_calls": [], "decisions": {},
+        "tool_rounds": 0, "aborted": False,
+        "snapshot_path": str(snap.path) if snap.available else "",
         "messages": [HumanMessage(content=task)],
     }
 
@@ -115,24 +129,64 @@ def _run(
         if on_event:
             on_event(ev)
 
-    with tracker.session():
-        try:
-            final = app.invoke(state, config=config)
-        except Exception as e:  # noqa: BLE001 —— 与 main.py 一致：给出可自愈提示后抛出
-            emit({"type": "error",
-                  "message": f"{type(e).__name__}: {e}",
-                  "hint": "若是旧会话 checkpoint 损坏，清理 .agent_cache/checkpoints.sqlite 后重试"})
-            raise
+    emit({"type": "log", "message": f"🛟 {snap.describe()}"})
 
-        while True:
-            req = _find_pending(config)
-            if req is None:
-                break
-            emit({"type": "approval", "approval_id": req.id, "question": req.question,
-                  "tool": req.tool, "args": req.args, "reason": req.reason})
-            approved = approve(req) if approve else False
-            # 恢复执行：与 main.py 的 Command(resume={"approved": ...}) 一致
-            final = app.invoke(Command(resume={"approved": approved}), config=config)
+    # 运行轨迹：控制台流式打印 + 落 JSONL，并把每条记录推给 on_event（Web 端转成 SSE 帧）。
+    # sink 在 trace 内部被 try/except 包着，所以前端断连不会反过来影响任务。
+    def _trace_sink(rec: dict, line: str) -> None:
+        emit({"type": "trace", "event": rec, "line": line})
 
-        emit({"type": "done", "result": final.get("result", ""), "cost": tracker.summary()})
+    with trace.session(task=task, thread_id=thread_id, project_id=workspace.current_id(),
+                       sinks=[_trace_sink]) as tracer:
+        tracer.emit("run.start", task=task, thread=thread_id,
+                    project=workspace.current_id(), workspace=str(workspace.current()),
+                    planner_model=settings.planner_model,
+                    executor_model=settings.executor_model, rag=settings.rag_enabled,
+                    exec_mode=sandbox.environment_note(),
+                    approval_policy=settings.resolved_approval_policy)
+        if tracer.path:      # 第一条事件落盘后才会有文件名，方便一边跑一边 tail
+            tracer.emit("log", message=f"轨迹文件：{tracer.path}")
+        tracer.emit("snapshot", state="establish" if snap.available else "unavailable",
+                    detail=snap.describe())
+        with tracker.session():
+            t0 = time.time()
+            try:
+                final = app.invoke(state, config=config)
+            except Exception as e:  # noqa: BLE001 —— 与 main.py 一致：给出可自愈提示后抛出
+                tracer.emit("error", where="app.invoke", error=f"{type(e).__name__}: {e}")
+                emit({"type": "error",
+                      "message": f"{type(e).__name__}: {e}",
+                      "hint": "若是旧会话 checkpoint 损坏，清理 .agent_cache/checkpoints.sqlite 后重试"})
+                raise
+
+            while True:
+                req = _find_pending(config)
+                if req is None:
+                    break
+                tracer.emit("approval", name=req.tool, args=req.args, reason=req.reason,
+                            escalation=req.escalation or None, approval_id=req.id)
+                emit({"type": "approval", "approval_id": req.id, "question": req.question,
+                      "tool": req.tool, "args": req.args, "reason": req.reason,
+                      "escalation": req.escalation})
+                waited = time.time()
+                approved = approve(req) if approve else False
+                tracer.emit("approval.result", name=req.tool, approved=approved,
+                            wait_ms=round((time.time() - waited) * 1000.0, 1),
+                            approval_id=req.id)
+                # 恢复执行：与 main.py 的 Command(resume={"approved": ...}) 一致
+                final = app.invoke(Command(resume={"approved": approved}), config=config)
+
+            # 任务结束：把"实际改了什么"作为机器采集的事实回给调用方（Web 直接显示）
+            change = snapshot.finish_after(snap)
+            tracer.emit("snapshot", state="finish", detail=change.summary(),
+                        change_stat=change.stat)
+            tracer.emit("log", message="最终结果：" + trace.brief(final.get("result") or "（空）", 400))
+            # 总耗时随 run.end 一起落盘（trace.session 退出时发 run.end）
+            duration_ms = round((time.time() - t0) * 1000.0, 1)
+            tracer.stats["duration_ms"] = duration_ms
+            emit({"type": "done", "result": final.get("result", ""), "cost": tracker.summary(),
+                  "snapshot": snap.describe(), "rollback": snap.rollback_hint(),
+                  "change": change.summary(), "change_stat": change.stat,
+                  "trace_file": str(tracer.path) if tracer.path else None,
+                  "trace_duration_ms": duration_ms})
     return final

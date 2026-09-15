@@ -55,6 +55,19 @@ class CostTracker(BaseCallbackHandler):
     def reset(self) -> None:
         self.models.clear()
 
+    def totals(self) -> dict:
+        """全部模型的合计（calls / input / output / total）。
+
+        给 trace.py 用：结构化输出（`.with_structured_output()`）的返回值上拿不到
+        usage_metadata，但挂在模型上的 callback 仍然记了账 —— 调用前后各取一次快照、
+        相减就是这次调用的 token 数。
+        """
+        agg = {"calls": 0, "input": 0, "output": 0, "total": 0}
+        for m in self.models.values():
+            for k in agg:
+                agg[k] += int(m.get(k, 0))
+        return agg
+
     def summary(self) -> str:
         if not self.models:
             return "（无 LLM 调用）"
@@ -94,6 +107,9 @@ class _TrackerProxy(BaseCallbackHandler):
 
     def reset(self) -> None:
         self._t().reset()
+
+    def totals(self) -> dict:
+        return self._t().totals()
 
     def summary(self) -> str:
         return self._t().summary()

@@ -22,12 +22,13 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import engine
 import dirpicker
 import memory
+import trace
 import workspace
 from config import settings
 from sandbox import effective_mode
@@ -324,7 +325,11 @@ def create_task(body: dict) -> dict:
 
 @app.get("/api/tasks/{tid}/events")
 def task_events(tid: str):
-    """SSE 事件流：log / approval / done / error / close。"""
+    """SSE 事件流：log / trace / approval / done / error / close。
+
+    `trace` 帧就是运行轨迹（见 trace.py）：每个节点、每次模型调用、每次工具调用
+    （含参数、耗时、token、异常）都会在发生的当下推给浏览器，界面右侧面板实时追加。
+    """
     h = _registry.get(tid)
     if h is None:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -337,6 +342,41 @@ def task_events(tid: str):
                 break
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# ---------- 运行轨迹（trace.py 落盘的 JSONL） ----------
+
+@app.get("/api/traces")
+def list_traces(limit: int = 50) -> dict:
+    """历史轨迹列表（新的在前）：事后复盘用，不依赖任务是否还在内存里。"""
+    return {"dir": str(trace.trace_dir()), "files": trace.list_files(limit=limit)}
+
+
+@app.get("/api/traces/{name}")
+def read_trace(name: str, limit: int = 2000):
+    """读取一份轨迹：既给结构化事件（events），也给渲染好的文本（text）。"""
+    try:
+        path = trace.resolve(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="轨迹文件不存在")
+    events = trace.read_events(path, limit=limit)
+    return {"name": path.name, "path": str(path), "count": len(events), "events": events,
+            "text": "\n".join(trace.render(rec) for rec in events)}
+
+
+@app.get("/api/traces/{name}/raw")
+def raw_trace(name: str):
+    """原始 JSONL（下载/外部工具用：jq、grep、数据帧分析都直接吃这个）。"""
+    try:
+        path = trace.resolve(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="轨迹文件不存在")
+    return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace"),
+                             media_type="application/x-ndjson")
 
 
 @app.post("/api/tasks/{tid}/approve")
