@@ -527,7 +527,12 @@ def state_dir(pid: str | None = None) -> Path:
 
 
 def memory_file() -> Path:
-    """长期记忆文件：按项目隔离，放在 agent 目录而非用户仓库。"""
+    """【遗留】早期长期记忆文件的位置，按项目隔离。
+
+    长期记忆现已改走 LangGraph Store（见 memory.py）：这个路径只在
+    `memory.migrate_from_memory_md()` 里被读取一次，用于把老内容导入 Store。
+    新代码不要再往这里写。
+    """
     return state_dir() / "memory.md"
 
 

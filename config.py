@@ -42,21 +42,56 @@ class Settings(BaseSettings):
         default_factory=lambda: Path(os.environ.get("WORKSPACE_ROOT", str(ROOT)))
     )
 
-    # ---- 运行模式开关 ----
-    # 默认 host（任意项目）：命令在本机直接执行，不假设语言，每条命令人工审批。
-    #   - exec_mode="host"：无容器隔离，安全靠 agent.py 的逐条审批兜底；
-    #     任意语言的项目（node/go/rust/…）都能直接跑，无需为每种语言建镜像。
-    #   - exec_mode="docker"：命令在非 root 沙箱容器内执行、默认断网，
-    #     但沙箱镜像目前只带 Python 运行时（见 Dockerfile.sandbox），
-    #     跑非 Python 项目需要在 .env 里改回 host 或自行扩展镜像。
+    # ---- 运行模式：两个正交旋钮（业界口径，见 README 第九章）----
+    # 旋钮 A · 强制隔离在哪：【local】内核围栏（macOS Seatbelt / Linux bubblewrap，
+    #   命令真的被关在工作区里）｜"host" 无隔离（逐条审批兜底）｜"docker" 容器隔离。
+    # 旋钮 B · sandbox_mode：read-only | workspace-write | danger-full-access（文件效果+网络）
+    # 旋钮 C · approval_policy：always（逐条问）| on-escalation（只在越界时才问，默认）
+    #                           | never（越界直接拒，适合无人值守）
+    # B/C 留空即按 A 推导（preset）：
+    #   local  → workspace-write + on-escalation   ← 业界主流：普通命令不问，越界才问
+    #   docker → danger-full-access + on-escalation（隔离由容器提供，沙箱镜像内默认为断网）
+    #   host   → danger-full-access + always       （没有围栏，只能靠人逐条把关）
     # rag_enabled=False 时不做 RAG 向量检索（省掉 torch/chroma/本地模型 ≈3~5GB），
     # agent 改用 list_files / search_code / read_file 工具自行定位代码。
     rag_enabled: bool = True
-    exec_mode: str = "host"   # "host"（默认，任意项目） | "docker"（Python 项目强隔离）
+    exec_mode: str = "local"
+    sandbox_mode: str = ""
+    approval_policy: str = ""
+
+    @property
+    def resolved_sandbox_mode(self) -> str:
+        """生效的文件效果策略（显式配置优先，否则按 exec_mode 推导）。"""
+        mode = (self.sandbox_mode or "").strip().lower()
+        if mode in ("read-only", "workspace-write", "danger-full-access"):
+            return mode
+        return "workspace-write" if self.exec_mode == "local" else "danger-full-access"
+
+    @property
+    def resolved_approval_policy(self) -> str:
+        """生效的审批策略（显式配置优先，否则按 exec_mode 推导）。"""
+        policy = (self.approval_policy or "").strip().lower()
+        if policy in ("always", "on-escalation", "never"):
+            return policy
+        return "always" if self.exec_mode == "host" else "on-escalation"
+
+    @property
+    def preset_name(self) -> str:
+        """一行展示当前组合，写进 prompt / 审批弹窗 / 日志。"""
+        return (f"{self.exec_mode}"
+                f"（sandbox={self.resolved_sandbox_mode}, "
+                f"approval={self.resolved_approval_policy}）")
 
     # RAG 索引是否自动跟随文件变动重建（按 REINDEX_TTL 间隔检测，见 rag.py）。
     # 关闭后索引只在首次/切换项目时建立，适合超大仓库。
     rag_auto_reindex: bool = True
+
+    # ---- 运行轨迹（observability，见 trace.py）----
+    # 三件事各管各的：控制台流式打印 / JSONL 落盘 / 预览长度。
+    trace_enabled: bool = True        # 落盘 .agent_cache/traces/*.jsonl
+    trace_console: bool = True        # 边跑边往终端打印（Web 服务端进程里也打）
+    trace_full_content: bool = False  # 连完整 prompt / 完整工具输出一起记（默认只记摘要与预览）
+    trace_dir: Path = Field(default_factory=lambda: ROOT / ".agent_cache" / "traces")
 
 
 settings = Settings()

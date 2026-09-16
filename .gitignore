@@ -22,3 +22,5 @@ chroma/
 # 日志
 *.log
 md/
+
+/tests

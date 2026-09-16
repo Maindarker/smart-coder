@@ -52,6 +52,16 @@
          padding: 12px; margin-top: 12px; white-space: pre-wrap; word-break: break-word;
          min-height: 140px; font-size: 14px; line-height: 1.6; }
 
+  /* 运行轨迹：任务一边跑一边追加（节点 / 模型 / 工具参数 / 耗时 / token / 异常） */
+  #tracebar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+  #tracebar button { padding: 3px 10px; font-size: 12px; }
+  #trace { background: #0d1117; color: #c9d1d9; border: 1px solid var(--line);
+           border-radius: 8px; padding: 10px 12px; margin-top: 8px; white-space: pre-wrap;
+           word-break: break-word; max-height: 360px; overflow: auto; font-size: 12px;
+           line-height: 1.6; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #trace.hidden, #tracebar .hidden { display: none; }
+  #traceLink { font-size: 12px; color: var(--accent); }
+
   /* 弹层通用 */
   .overlay { position: fixed; inset: 0; background: #0008; display: none;
              align-items: center; justify-content: center; padding: 16px; }
@@ -96,6 +106,14 @@
 <textarea id="task" placeholder="例如：这个项目的测试怎么跑？跑一下并修掉失败的用例"></textarea>
 <div><button id="run" class="primary">运行任务</button></div>
 <div id="log">（运行结果会显示在这里）</div>
+
+<!-- 运行轨迹：实时显示每一步（也存在 .agent_cache/traces/*.jsonl 里） -->
+<div id="tracebar">
+  <button id="traceToggle" title="显示 / 隐藏实时轨迹">▾ 运行轨迹</button>
+  <span class="note" id="traceInfo">任务运行时，每一步（节点 / 模型 / 工具参数 / 耗时 / token / 异常）会实时显示在这里</span>
+  <a id="traceLink" class="hidden" href="#" target="_blank" rel="noopener">下载本次 JSONL</a>
+</div>
+<pre id="trace">（还没有运行任务）</pre>
 
 <!-- 危险操作审批 -->
 <div id="dialog" class="overlay">
@@ -337,6 +355,41 @@ $('goBtn').onclick = () => browse($('manualPath').value.trim());
 $('manualPath').onkeydown = e => { if (e.key === 'Enter') browse($('manualPath').value.trim()); };
 
 /* ---------- 任务执行 ---------- */
+let traceSteps = 0;
+
+function resetTrace() {
+  traceSteps = 0;
+  $('trace').textContent = '';
+  $('traceInfo').textContent = '正在实时记录运行轨迹…';
+  $('traceLink').classList.add('hidden');
+  $('traceLink').removeAttribute('href');
+}
+
+function appendTrace(line) {
+  if (!line) return;
+  const el = $('trace');
+  el.textContent += (el.textContent ? '\n' : '') + line;
+  el.scrollTop = el.scrollHeight;
+  traceSteps += 1;
+  $('traceInfo').textContent = `运行轨迹：已记录 ${traceSteps} 步（实时刷新中）`;
+}
+
+function showTraceFile(path) {
+  if (!path) return;
+  const name = path.split('/').pop();
+  const link = $('traceLink');
+  link.href = '/api/traces/' + encodeURIComponent(name) + '/raw';
+  link.classList.remove('hidden');
+  $('traceInfo').textContent = `运行轨迹：共 ${traceSteps} 步 · ${path}`;
+}
+
+$('traceToggle').onclick = () => {
+  const el = $('trace');
+  const hidden = !el.classList.contains('hidden');
+  el.classList.toggle('hidden', hidden);
+  $('traceToggle').textContent = (hidden ? '▸' : '▾') + ' 运行轨迹';
+};
+
 async function submit() {
   if (busy) return;
   const task = $('task').value.trim();
@@ -345,6 +398,7 @@ async function submit() {
 
   busy = true; $('run').disabled = true;
   $('log').textContent = '任务已提交，等待执行…\n';
+  resetTrace();
 
   try {
     const r = await api('/api/tasks', {
@@ -368,11 +422,17 @@ async function submit() {
         + '<pre>' + esc(JSON.stringify(ev.args, null, 2)) + '</pre>';
       $('dialog').classList.add('open');
     } else if (ev.type === 'done') {
-      append('\n━━━ 完成 ━━━\n' + ev.result + '\n' + ev.cost);
+      showTraceFile(ev.trace_file);
+      append('\n━━━ 完成 ━━━\n' + ev.result
+        + (('\n\n📝 本次实际改动（git 采集）：' + ev.change) || '')
+        + '\n\n' + ev.cost
+        + (ev.trace_file ? '\n\n🧭 运行轨迹（JSONL）：' + ev.trace_file : ''));
       es.close(); finish();
     } else if (ev.type === 'error') {
       append('\n❌ ' + ev.message + (ev.hint ? '\n💡 ' + ev.hint : ''));
       es.close(); finish();
+    } else if (ev.type === 'trace') {
+      appendTrace(ev.line);
     } else if (ev.type === 'log') {
       append('\n' + ev.message);
     }
